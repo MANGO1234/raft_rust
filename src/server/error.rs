@@ -1,4 +1,4 @@
-use std::{fmt, error, result};
+use std::{error, fmt, result};
 
 pub type Result<T> = result::Result<T, SvrErr>;
 
@@ -20,15 +20,7 @@ impl fmt::Display for SvrErr {
 }
 
 impl error::Error for SvrErr {
-    fn description(&self) -> &str {
-        match *self {
-            SvrErr::Io(ref err) => err.description(),
-            SvrErr::Parse(ref err) => error::Error::description(err),
-            SvrErr::UTF8(ref err) => error::Error::description(err),
-        }
-    }
-
-    fn cause(&self) -> Option<&error::Error> {
+    fn cause(&self) -> Option<&dyn error::Error> {
         match *self {
             SvrErr::Io(ref err) => Some(err),
             SvrErr::Parse(ref err) => Some(err),

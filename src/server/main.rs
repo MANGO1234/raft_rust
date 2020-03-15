@@ -2,8 +2,9 @@ mod error;
 
 use error::{Result, SvrErr};
 use raft_rust::common::{SvrMsgCmd, SvrMsgResp};
+use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::rc::Rc;
@@ -13,40 +14,61 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use std::{env, thread};
 
-static mut svr_addr: Option<&str> = None;
+static mut SVR_ADDR: Option<&str> = None;
 
 fn get_self_addr() -> &'static str {
-    let a = unsafe { svr_addr.unwrap() };
+    let a = unsafe { SVR_ADDR.unwrap() };
     return a;
 }
 
 fn set_self_addr(s: &'static str) {
     unsafe {
-        svr_addr = Some(s);
+        SVR_ADDR = Some(s);
     }
 }
 
+type NodeId = i32;
+
+#[derive(Debug)]
 enum SvrState {
     Leader,
-    Follower,
-    Candidate,
+    Follower {
+        leader: Option<NodeId>,
+        leader_last_contact: Instant,
+    },
+    Candidate {
+        voted: HashSet<NodeId>,
+        election_timeout: Duration,
+        first_req_vote: Instant,
+        last_req_vote: Instant,
+    },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 enum PeerMsg {
-    AppendEntries,
-    RequestVote,
-}
-
-struct SvrCtx {
-    state: SvrState,
-    term: u64,
-    leader: Option<Peer>,
-    leader_last_contact: Instant,
-    peers: HashMap<SocketAddr, Peer>,
+    HeartBeat {
+        node_id: NodeId,
+        term: u64,
+    },
+    HeartBeatResp {
+        node_id: NodeId,
+        term: u64,
+        success: bool,
+    },
+    RequestVote {
+        node_id: NodeId,
+        term: u64,
+        last_log_idx: u64,
+    },
+    RequestVoteResp {
+        node_id: NodeId,
+        term: u64,
+        vote_granted: bool,
+    },
 }
 
 struct Peer {
+    node_id: NodeId,
     addr: SocketAddr,
     last_contact: Instant,
     sender: SyncSender<PeerMsg>,
@@ -190,7 +212,7 @@ fn handle_peer_msg(mut stream: TcpStream, sender: SyncSender<(SocketAddr, PeerMs
         stream.read_exact(msg.as_mut_slice())?;
         let str = String::from_utf8(msg)?;
         let msg: PeerMsg = serde_json::from_str(str.as_str())?;
-        sender.send((stream.peer_addr().unwrap(), msg));
+        let _ = sender.send((stream.peer_addr().unwrap(), msg));
         println!(
             "{}: received from {} {}",
             get_self_addr(),
@@ -198,66 +220,251 @@ fn handle_peer_msg(mut stream: TcpStream, sender: SyncSender<(SocketAddr, PeerMs
             str
         );
     }
-    Ok(())
 }
 
-impl SvrCtx {
-    fn addPeer(&mut self, addr: SocketAddr) {
+impl RaftCtx {
+    fn add_peer(&mut self, node_id: NodeId, addr: SocketAddr) {
         let (sender, receiver) = sync_channel(10000);
         let peer = Peer {
+            node_id: node_id,
             addr: addr,
             last_contact: Instant::now(),
             sender: sender,
         };
         let a = peer.addr.clone();
-        self.peers.insert(a.clone(), peer);
+        self.peers.insert(node_id, peer);
         thread::spawn(move || {
             raft_peer_sender(a, receiver);
         });
     }
+
+    fn find_peer(&self, node_id: NodeId) -> Option<&Peer> {
+        self.peers.get(&node_id)
+    }
+
+    fn find_peer_mut(&mut self, node_id: NodeId) -> Option<&mut Peer> {
+        self.peers.get_mut(&node_id)
+    }
+
+    fn to_candidate(&mut self) {
+        self.term += 1;
+        let mut rng = thread_rng();
+        self.state = SvrState::Candidate {
+            voted: HashSet::new(),
+            election_timeout: Duration::from_millis(rng.gen_range(4000, 7000)),
+            first_req_vote: Instant::now(),
+            last_req_vote: Instant::now(),
+        };
+    }
+
+    fn to_follower(&mut self, term: u64, node_id: NodeId) {
+        self.state = SvrState::Follower {
+            leader: Some(node_id),
+            leader_last_contact: Instant::now(),
+        };
+        self.term = term;
+    }
+
+    fn to_leader(&mut self) {
+        self.state = SvrState::Leader;
+    }
 }
 
-fn raft_main(a_addr: String, b_addr: String, msg_receiver: Receiver<(SocketAddr, PeerMsg)>) {
-    let mut ctx = SvrCtx {
-        state: SvrState::Follower,
+struct PeerInfo {
+    addr: SocketAddr,
+    node_id: NodeId,
+}
+
+fn broadcast_request_vote_msg(term: u64, node_id: NodeId, peers: &mut HashMap<NodeId, Peer>) {
+    for (_, peer) in peers {
+        let _ = peer.sender.send(PeerMsg::RequestVote {
+            term,
+            node_id,
+            last_log_idx: 0,
+        });
+    }
+}
+
+fn send_request_vote_resp_msg(ctx: &mut RaftCtx, peer_node_id: NodeId, vote_granted: bool) {
+    let term = ctx.term;
+    let node_id = ctx.node_id;
+    let peer = ctx.find_peer_mut(peer_node_id);
+    if let Some(peer) = peer {
+        let _ = peer.sender.send(PeerMsg::RequestVoteResp {
+            node_id,
+            term,
+            vote_granted,
+        });
+    }
+}
+
+fn send_heartbeat_msg(peer: &mut Peer, term: u64) {
+    let _ = peer.sender.send(PeerMsg::HeartBeat {
+        node_id: peer.node_id,
+        term,
+    });
+}
+
+struct RaftCtx {
+    node_id: NodeId,
+    state: SvrState,
+    term: u64,
+    peers: HashMap<NodeId, Peer>,
+}
+
+fn raft_main(
+    a_addr: PeerInfo,
+    b_addr: PeerInfo,
+    msg_receiver: Receiver<(SocketAddr, PeerMsg)>,
+    node_id: i32,
+) {
+    let mut ctx = RaftCtx {
+        node_id,
+        state: SvrState::Follower {
+            leader: None,
+            leader_last_contact: Instant::now(),
+        },
         term: 0,
-        leader: None,
-        leader_last_contact: Instant::now(),
         peers: HashMap::new(),
     };
 
-    ctx.addPeer(SocketAddr::from_str(a_addr.as_str()).unwrap());
-    ctx.addPeer(SocketAddr::from_str(b_addr.as_str()).unwrap());
+    ctx.add_peer(a_addr.node_id, a_addr.addr);
+    ctx.add_peer(b_addr.node_id, b_addr.addr);
 
     let mut last_heart_beat = Instant::now();
+    let mut last_print_state = Instant::now();
     loop {
-        match msg_receiver.recv_timeout(Duration::from_millis(500)) {
-            Ok((Addr, PeerMsg)) => (),
+        if last_print_state.elapsed().as_millis() >= 1000 {
+            println!("{}: {:?}", get_self_addr(), ctx.state);
+            last_print_state = Instant::now();
+        }
+        match msg_receiver.recv_timeout(Duration::from_millis(400)) {
+            Ok((addr, msg)) => match msg {
+                PeerMsg::HeartBeat { node_id, term } => {
+                    if ctx.term < term {
+                        ctx.to_follower(term, node_id);
+                    } else if ctx.term == term {
+                        match ctx.state {
+                            SvrState::Follower {
+                                leader,
+                                ref mut leader_last_contact,
+                            } => {
+                                let mut updated = false;
+                                if let Some(leader) = leader {
+                                    if leader == node_id {
+                                        *leader_last_contact = Instant::now();
+                                        updated = true;
+                                    }
+                                }
+                                if !updated {
+                                    ctx.to_follower(term, node_id);
+                                }
+                            }
+                            SvrState::Candidate { .. } => {
+                                ctx.to_follower(term, node_id);
+                            }
+                            SvrState::Leader => {
+                                // todo
+                            }
+                        }
+                    } else {
+                        // todo
+                    }
+                }
+                PeerMsg::RequestVote {
+                    node_id,
+                    last_log_idx,
+                    term,
+                } => {
+                    if ctx.term < term {
+                        ctx.to_follower(term, node_id);
+                        send_request_vote_resp_msg(&mut ctx, node_id, true);
+                    } else if term == ctx.term {
+                        send_request_vote_resp_msg(&mut ctx, node_id, false);
+                    } else {
+                        // ignore
+                    }
+                }
+                PeerMsg::RequestVoteResp {
+                    node_id,
+                    term,
+                    vote_granted,
+                } => {
+                    if let SvrState::Candidate { voted, .. } = &mut ctx.state {
+                        if ctx.term < term {
+                            ctx.term = term; // increased to newest term for next election
+                        } else if ctx.term == term {
+                            if vote_granted {
+                                voted.insert(node_id);
+                                if voted.len() >= ctx.peers.len() / 2 {
+                                    ctx.to_leader();
+                                }
+                            }
+                        } else {
+                            // ignore
+                        }
+                    }
+                }
+                PeerMsg::HeartBeatResp {
+                    node_id,
+                    term,
+                    success,
+                } => {
+                    // todo
+                }
+            },
             Err(_) => (),
         }
 
-        if last_heart_beat.elapsed().as_millis() >= 3000 {
-            for (_, peer) in &ctx.peers {
-                peer.sender.send(PeerMsg::AppendEntries);
+        match ctx.state {
+            SvrState::Leader => {
+                if last_heart_beat.elapsed().as_millis() >= 500 {
+                    for (_, peer) in &mut ctx.peers {
+                        send_heartbeat_msg(peer, ctx.term);
+                    }
+                    last_heart_beat = Instant::now();
+                }
             }
-            last_heart_beat = Instant::now();
+            SvrState::Follower {
+                leader_last_contact,
+                ..
+            } => {
+                if leader_last_contact.elapsed().as_millis() >= 5000 {
+                    ctx.to_candidate();
+                    broadcast_request_vote_msg(ctx.term, ctx.node_id, &mut ctx.peers);
+                }
+            }
+            SvrState::Candidate {
+                first_req_vote,
+                ref mut last_req_vote,
+                election_timeout,
+                ..
+            } => {
+                if first_req_vote.elapsed() >= election_timeout {
+                    ctx.to_candidate();
+                    broadcast_request_vote_msg(ctx.term, ctx.node_id, &mut ctx.peers);
+                } else if last_req_vote.elapsed().as_millis() >= 500 {
+                    broadcast_request_vote_msg(ctx.term, ctx.node_id, &mut ctx.peers);
+                    *last_req_vote = Instant::now();
+                }
+            }
         }
     }
 }
 
 // I was going to try async io, then realize the design would be similar to threaded io anyway
 // so just going to do that instead
-fn raft_listen_main(self_addr: &str, a_addr: String, b_addr: String) {
+fn raft_listen_main(self_addr: &str, a_addr: PeerInfo, b_addr: PeerInfo, node_id: i32) {
     let (sender, receiver) = sync_channel(10000);
     thread::spawn(move || {
-        raft_main(a_addr, b_addr, receiver);
+        raft_main(a_addr, b_addr, receiver, node_id);
     });
 
-    let mut listener;
+    let listener;
     loop {
         let l = TcpListener::bind(self_addr);
         if let Err(e) = l {
-            println!("Error while binding to {}", self_addr);
+            println!("Error while binding to {}: {}", self_addr, e);
         } else {
             listener = l.unwrap();
             break;
@@ -266,7 +473,7 @@ fn raft_listen_main(self_addr: &str, a_addr: String, b_addr: String) {
     }
     loop {
         match listener.accept() {
-            Ok((mut stream, addr)) => {
+            Ok((stream, addr)) => {
                 println!("{}: Accepted {}!", self_addr, addr);
                 let sender = sender.clone();
                 thread::spawn(move || match handle_peer_msg(stream, sender) {
@@ -290,21 +497,43 @@ fn main() -> std::io::Result<()> {
     let self_addr;
     let a_addr;
     let b_addr;
+    let node_id;
     if args[1].as_str() == "1" {
         self_addr = "127.0.0.1:10001";
-        a_addr = "127.0.0.1:10002";
-        b_addr = "127.0.0.1:10003";
+        a_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10002").unwrap(),
+            node_id: 2,
+        };
+        b_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10003").unwrap(),
+            node_id: 3,
+        };
         cmd_addr = "127.0.0.1:12001";
+        node_id = 1;
     } else if args[1].as_str() == "2" {
         self_addr = "127.0.0.1:10002";
-        a_addr = "127.0.0.1:10001";
-        b_addr = "127.0.0.1:10003";
+        a_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10001").unwrap(),
+            node_id: 1,
+        };
+        b_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10003").unwrap(),
+            node_id: 3,
+        };
         cmd_addr = "127.0.0.1:12002";
+        node_id = 2;
     } else if args[1].as_str() == "3" {
         self_addr = "127.0.0.1:10003";
-        a_addr = "127.0.0.1:10001";
-        b_addr = "127.0.0.1:10002";
+        a_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10001").unwrap(),
+            node_id: 1,
+        };
+        b_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10002").unwrap(),
+            node_id: 2,
+        };
         cmd_addr = "127.0.0.1:12003";
+        node_id = 3;
     } else {
         println!("[1|2|3]");
         return Ok(());
@@ -312,7 +541,7 @@ fn main() -> std::io::Result<()> {
     set_self_addr(self_addr);
 
     thread::spawn(move || {
-        raft_listen_main(self_addr, a_addr.to_string(), b_addr.to_string());
+        raft_listen_main(self_addr, a_addr, b_addr, node_id);
     });
 
     let (cmd_sender, cmd_receiver) = sync_channel(1000);

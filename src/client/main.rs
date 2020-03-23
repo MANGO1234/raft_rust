@@ -23,8 +23,8 @@ fn run_cmd(cmd: SvrMsgCmd) -> std::io::Result<()> {
 }
 
 fn main() -> std::io::Result<()> {
-    run_cmd(SvrMsgCmd::ValSet("a", "b"))?;
-    run_cmd(SvrMsgCmd::ValGet("a"))?;
-    run_cmd(SvrMsgCmd::ValGet("c"))?;
+    run_cmd(SvrMsgCmd::ValSet("a".to_string(), "b".to_string()))?;
+    run_cmd(SvrMsgCmd::ValGet("a".to_string()))?;
+    run_cmd(SvrMsgCmd::ValGet("c".to_string()))?;
     Ok(())
 }

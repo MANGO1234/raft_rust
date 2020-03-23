@@ -2,9 +2,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum SvrMsgCmd<'a> {
-    ValGet(&'a str),
-    ValSet(&'a str, &'a str),
+pub enum SvrMsgCmd {
+    ValGet(String),
+    ValSet(String, String),
 }
 
 #[derive(Serialize, Deserialize, Debug)]

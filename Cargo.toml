@@ -15,3 +15,9 @@ path = "src/server/main.rs"
 [[bin]]
 name = "client"
 path = "src/client/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

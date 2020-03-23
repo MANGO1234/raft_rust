@@ -7,9 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::ops::Sub;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::{Arc, RwLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use std::{env, thread};
@@ -31,7 +33,9 @@ type NodeId = i32;
 
 #[derive(Debug)]
 enum SvrState {
-    Leader,
+    Leader {
+        last_heart_beat: Instant,
+    },
     Follower {
         leader: Option<NodeId>,
         leader_last_contact: Instant,
@@ -67,6 +71,21 @@ enum PeerMsg {
     },
 }
 
+#[derive(Debug)]
+enum InternalMsg {
+    Peer(PeerMsg),
+    Clt(SvrMsgCmd, SyncSender<InternalMsg>),
+    CltResp(CltMsgResp),
+}
+
+#[derive(Debug)]
+pub enum CltMsgResp {
+    Val(Arc<String>),
+    Empty,
+    Ok,
+    Err(String),
+}
+
 struct Peer {
     node_id: NodeId,
     addr: SocketAddr,
@@ -75,71 +94,19 @@ struct Peer {
 }
 
 struct Record {
-    data: Vec<u8>,
+    index: u64,
+    term: u64,
+    key: Arc<String>,
+    val: Arc<String>,
 }
 
 struct Log {
-    records: Vec<(Rc<String>, Rc<String>)>,
-    map: HashMap<Rc<String>, Rc<String>>,
+    records: Vec<Record>,
+    map: HashMap<Arc<String>, Arc<String>>,
+    latest_index: u64,
 }
 
-struct Ctx {
-    log: Log,
-}
-
-fn handle_cmd(ctx: &mut Ctx, cmd_buf: Vec<u8>, resp_sender: Sender<String>) -> Result<()> {
-    let cmd_str = String::from_utf8(cmd_buf)?;
-    let cmd: SvrMsgCmd = serde_json::from_str(cmd_str.as_str())?;
-    println!("handling cmd {:?}", cmd);
-
-    match cmd {
-        SvrMsgCmd::ValGet(key) => {
-            let val = ctx.log.map.get(&key.to_string());
-            match val {
-                Some(val) => resp_sender
-                    .send(serde_json::to_string(&SvrMsgResp::Val(val.as_str())).unwrap())
-                    .unwrap(),
-                None => resp_sender
-                    .send(serde_json::to_string(&SvrMsgResp::Empty).unwrap())
-                    .unwrap(),
-            };
-        }
-        SvrMsgCmd::ValSet(key, val) => {
-            let key = Rc::new(key.to_string());
-            let val = Rc::new(val.to_string());
-            ctx.log.records.push((key.clone(), val.clone()));
-            ctx.log.map.insert(key, val);
-            resp_sender
-                .send(serde_json::to_string(&SvrMsgResp::Ok).unwrap())
-                .unwrap();
-        }
-    }
-    Ok(())
-}
-
-fn exec(receiver: Receiver<(Vec<u8>, Sender<String>)>) {
-    let mut ctx = Ctx {
-        log: Log {
-            records: Vec::new(),
-            map: HashMap::new(),
-        },
-    };
-
-    loop {
-        match receiver.recv_timeout(Duration::from_secs(1)) {
-            Ok((cmd_buf, resp_sender)) => match handle_cmd(&mut ctx, cmd_buf, resp_sender) {
-                Ok(_) => continue,
-                Err(e) => println!("Error occur handling{:?}", e),
-            },
-            Err(_) => continue,
-        }
-    }
-}
-
-fn handle_client(
-    mut stream: TcpStream,
-    cmd_sender: SyncSender<(Vec<u8>, Sender<String>)>,
-) -> Result<()> {
+fn handle_client(mut stream: TcpStream, cmd_sender: SyncSender<InternalMsg>) -> Result<()> {
     println!("handling cmd from {}", stream.peer_addr().unwrap());
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -151,10 +118,27 @@ fn handle_client(
     let mut cmd_buf = vec![0u8; size as usize];
     stream.read_exact(cmd_buf.as_mut_slice())?;
 
-    let (resp_sender, resp_receiver) = channel();
-    cmd_sender.send((cmd_buf, resp_sender)).unwrap();
-    let cmd_msg = resp_receiver.recv().unwrap();
-    stream.write(cmd_msg.as_bytes())?;
+    let cmd_str = String::from_utf8(cmd_buf)?;
+    let cmd: SvrMsgCmd = serde_json::from_str(cmd_str.as_str())?;
+    println!("handling cmd {:?}", cmd);
+    let (sender, receiver) = sync_channel(1);
+    let mut clt_resp = None;
+    if let Ok(_) = cmd_sender.send(InternalMsg::Clt(cmd, sender)) {
+        if let Ok(InternalMsg::CltResp(resp)) = receiver.recv() {
+            clt_resp = Some(resp);
+        }
+    };
+    let resp = if let Some(clt_resp) = &clt_resp {
+        match clt_resp {
+            CltMsgResp::Ok => SvrMsgResp::Ok,
+            CltMsgResp::Empty => SvrMsgResp::Empty,
+            CltMsgResp::Err(msg) => SvrMsgResp::Err(msg.as_str()),
+            CltMsgResp::Val(msg) => SvrMsgResp::Err(msg.as_str()),
+        }
+    } else {
+        SvrMsgResp::Err("Internal Error")
+    };
+    stream.write(serde_json::to_string(&resp).unwrap().as_bytes())?;
     stream.flush()?;
     Ok(())
 }
@@ -195,12 +179,12 @@ fn raft_peer_sender(peer_addr: SocketAddr, receiver: Receiver<PeerMsg>) {
                 }
             }
         } else {
-            sleep(Duration::from_secs(1));
+            sleep(Duration::from_millis(300));
         }
     }
 }
 
-fn handle_peer_msg(mut stream: TcpStream, sender: SyncSender<(SocketAddr, PeerMsg)>) -> Result<()> {
+fn handle_peer_conn(mut stream: TcpStream, sender: SyncSender<InternalMsg>) -> Result<()> {
     loop {
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf)?;
@@ -212,7 +196,7 @@ fn handle_peer_msg(mut stream: TcpStream, sender: SyncSender<(SocketAddr, PeerMs
         stream.read_exact(msg.as_mut_slice())?;
         let str = String::from_utf8(msg)?;
         let msg: PeerMsg = serde_json::from_str(str.as_str())?;
-        let _ = sender.send((stream.peer_addr().unwrap(), msg));
+        let _ = sender.send(InternalMsg::Peer(msg));
         println!(
             "{}: received from {} {}",
             get_self_addr(),
@@ -266,7 +250,10 @@ impl RaftCtx {
     }
 
     fn to_leader(&mut self) {
-        self.state = SvrState::Leader;
+        self.state = SvrState::Leader {
+            // send heartbeat immediately
+            last_heart_beat: Instant::now().sub(Duration::from_secs(10)),
+        };
     }
 }
 
@@ -275,7 +262,7 @@ struct PeerInfo {
     node_id: NodeId,
 }
 
-fn broadcast_request_vote_msg(term: u64, node_id: NodeId, peers: &mut HashMap<NodeId, Peer>) {
+fn broadcast_request_vote_msg(peers: &mut HashMap<NodeId, Peer>, term: u64, node_id: NodeId) {
     for (_, peer) in peers {
         let _ = peer.sender.send(PeerMsg::RequestVote {
             term,
@@ -298,11 +285,8 @@ fn send_request_vote_resp_msg(ctx: &mut RaftCtx, peer_node_id: NodeId, vote_gran
     }
 }
 
-fn send_heartbeat_msg(peer: &mut Peer, term: u64) {
-    let _ = peer.sender.send(PeerMsg::HeartBeat {
-        node_id: peer.node_id,
-        term,
-    });
+fn send_heartbeat_msg(peer: &mut Peer, term: u64, node_id: NodeId) {
+    let _ = peer.sender.send(PeerMsg::HeartBeat { node_id, term });
 }
 
 struct RaftCtx {
@@ -310,12 +294,123 @@ struct RaftCtx {
     state: SvrState,
     term: u64,
     peers: HashMap<NodeId, Peer>,
+    log: Log,
+}
+
+fn handle_peer_msg(ctx: &mut RaftCtx, msg: PeerMsg) {
+    match msg {
+        PeerMsg::HeartBeat { node_id, term } => {
+            if ctx.term < term {
+                ctx.to_follower(term, node_id);
+            } else if ctx.term == term {
+                match ctx.state {
+                    SvrState::Follower {
+                        ref mut leader,
+                        ref mut leader_last_contact,
+                    } => {
+                        *leader_last_contact = Instant::now();
+                        if let Some(leader) = leader {
+                            if *leader != node_id {
+                                dbg!(leader);
+                                dbg!(node_id);
+                                // something went wrong with server logic
+                                panic!();
+                            }
+                        } else {
+                            *leader = Some(node_id)
+                        }
+                    }
+                    SvrState::Candidate { .. } => {
+                        ctx.to_follower(term, node_id);
+                    }
+                    SvrState::Leader { .. } => {
+                        // something went wrong with server logic
+                        panic!();
+                    }
+                }
+            } else {
+                // ignore, older leader's heartbeat
+            }
+        }
+        PeerMsg::RequestVote {
+            node_id,
+            last_log_idx,
+            term,
+        } => {
+            if ctx.term < term {
+                ctx.to_follower(term, node_id);
+                send_request_vote_resp_msg(ctx, node_id, true);
+            } else if term == ctx.term {
+                send_request_vote_resp_msg(ctx, node_id, false);
+            } else {
+                // ignore, older leader's request
+            }
+        }
+        PeerMsg::RequestVoteResp {
+            node_id,
+            term,
+            vote_granted,
+        } => {
+            if let SvrState::Candidate { voted, .. } = &mut ctx.state {
+                if ctx.term < term {
+                    ctx.to_follower(term, node_id);
+                } else if ctx.term == term {
+                    if vote_granted {
+                        voted.insert(node_id);
+                        if voted.len() >= ctx.peers.len() / 2 {
+                            ctx.to_leader();
+                        }
+                    }
+                } else {
+                    // ignore, we don't need to tally votes if not candidate
+                }
+            }
+        }
+        PeerMsg::HeartBeatResp {
+            node_id,
+            term,
+            success,
+        } => {
+            // todo
+        }
+    }
+}
+
+fn handle_clt_msg(ctx: &mut RaftCtx, cmd: SvrMsgCmd, resp_sender: SyncSender<InternalMsg>) {
+    match cmd {
+        SvrMsgCmd::ValGet(key) => {
+            match ctx.log.map.get(&key.to_string()) {
+                Some(val) => resp_sender
+                    .try_send(InternalMsg::CltResp(CltMsgResp::Val(val.clone())))
+                    .unwrap(),
+                None => resp_sender
+                    .try_send(InternalMsg::CltResp(CltMsgResp::Empty))
+                    .unwrap(),
+            };
+        }
+        SvrMsgCmd::ValSet(key, val) => {
+            let key = Arc::new(key);
+            let val = Arc::new(val);
+            ctx.log.latest_index += 1;
+            let record = Record {
+                index: ctx.log.latest_index,
+                term: 1,
+                key: key.clone(),
+                val: val.clone(),
+            };
+            ctx.log.records.push(record);
+            ctx.log.map.insert(key, val);
+            resp_sender
+                .try_send(InternalMsg::CltResp(CltMsgResp::Ok))
+                .unwrap()
+        }
+    }
 }
 
 fn raft_main(
     a_addr: PeerInfo,
     b_addr: PeerInfo,
-    msg_receiver: Receiver<(SocketAddr, PeerMsg)>,
+    msg_receiver: Receiver<InternalMsg>,
     node_id: i32,
 ) {
     let mut ctx = RaftCtx {
@@ -326,12 +421,16 @@ fn raft_main(
         },
         term: 0,
         peers: HashMap::new(),
+        log: Log {
+            latest_index: 0,
+            records: Vec::new(),
+            map: HashMap::new(),
+        },
     };
 
     ctx.add_peer(a_addr.node_id, a_addr.addr);
     ctx.add_peer(b_addr.node_id, b_addr.addr);
 
-    let mut last_heart_beat = Instant::now();
     let mut last_print_state = Instant::now();
     loop {
         if last_print_state.elapsed().as_millis() >= 1000 {
@@ -339,90 +438,27 @@ fn raft_main(
             last_print_state = Instant::now();
         }
         match msg_receiver.recv_timeout(Duration::from_millis(400)) {
-            Ok((addr, msg)) => match msg {
-                PeerMsg::HeartBeat { node_id, term } => {
-                    if ctx.term < term {
-                        ctx.to_follower(term, node_id);
-                    } else if ctx.term == term {
-                        match ctx.state {
-                            SvrState::Follower {
-                                leader,
-                                ref mut leader_last_contact,
-                            } => {
-                                let mut updated = false;
-                                if let Some(leader) = leader {
-                                    if leader == node_id {
-                                        *leader_last_contact = Instant::now();
-                                        updated = true;
-                                    }
-                                }
-                                if !updated {
-                                    ctx.to_follower(term, node_id);
-                                }
-                            }
-                            SvrState::Candidate { .. } => {
-                                ctx.to_follower(term, node_id);
-                            }
-                            SvrState::Leader => {
-                                // todo
-                            }
-                        }
-                    } else {
-                        // todo
-                    }
+            Ok(msg) => match msg {
+                InternalMsg::Peer(peer_msg) => {
+                    handle_peer_msg(&mut ctx, peer_msg);
                 }
-                PeerMsg::RequestVote {
-                    node_id,
-                    last_log_idx,
-                    term,
-                } => {
-                    if ctx.term < term {
-                        ctx.to_follower(term, node_id);
-                        send_request_vote_resp_msg(&mut ctx, node_id, true);
-                    } else if term == ctx.term {
-                        send_request_vote_resp_msg(&mut ctx, node_id, false);
-                    } else {
-                        // ignore
-                    }
+                InternalMsg::Clt(cmd, sender) => {
+                    handle_clt_msg(&mut ctx, cmd, sender);
                 }
-                PeerMsg::RequestVoteResp {
-                    node_id,
-                    term,
-                    vote_granted,
-                } => {
-                    if let SvrState::Candidate { voted, .. } = &mut ctx.state {
-                        if ctx.term < term {
-                            ctx.term = term; // increased to newest term for next election
-                        } else if ctx.term == term {
-                            if vote_granted {
-                                voted.insert(node_id);
-                                if voted.len() >= ctx.peers.len() / 2 {
-                                    ctx.to_leader();
-                                }
-                            }
-                        } else {
-                            // ignore
-                        }
-                    }
-                }
-                PeerMsg::HeartBeatResp {
-                    node_id,
-                    term,
-                    success,
-                } => {
-                    // todo
-                }
+                _ => (),
             },
             Err(_) => (),
         }
 
         match ctx.state {
-            SvrState::Leader => {
+            SvrState::Leader {
+                ref mut last_heart_beat,
+            } => {
                 if last_heart_beat.elapsed().as_millis() >= 500 {
                     for (_, peer) in &mut ctx.peers {
-                        send_heartbeat_msg(peer, ctx.term);
+                        send_heartbeat_msg(peer, ctx.term, ctx.node_id);
                     }
-                    last_heart_beat = Instant::now();
+                    *last_heart_beat = Instant::now();
                 }
             }
             SvrState::Follower {
@@ -431,7 +467,7 @@ fn raft_main(
             } => {
                 if leader_last_contact.elapsed().as_millis() >= 5000 {
                     ctx.to_candidate();
-                    broadcast_request_vote_msg(ctx.term, ctx.node_id, &mut ctx.peers);
+                    broadcast_request_vote_msg(&mut ctx.peers, ctx.term, ctx.node_id);
                 }
             }
             SvrState::Candidate {
@@ -442,9 +478,9 @@ fn raft_main(
             } => {
                 if first_req_vote.elapsed() >= election_timeout {
                     ctx.to_candidate();
-                    broadcast_request_vote_msg(ctx.term, ctx.node_id, &mut ctx.peers);
+                    broadcast_request_vote_msg(&mut ctx.peers, ctx.term, ctx.node_id);
                 } else if last_req_vote.elapsed().as_millis() >= 500 {
-                    broadcast_request_vote_msg(ctx.term, ctx.node_id, &mut ctx.peers);
+                    broadcast_request_vote_msg(&mut ctx.peers, ctx.term, ctx.node_id);
                     *last_req_vote = Instant::now();
                 }
             }
@@ -454,8 +490,14 @@ fn raft_main(
 
 // I was going to try async io, then realize the design would be similar to threaded io anyway
 // so just going to do that instead
-fn raft_listen_main(self_addr: &str, a_addr: PeerInfo, b_addr: PeerInfo, node_id: i32) {
-    let (sender, receiver) = sync_channel(10000);
+fn raft_listen_main(
+    self_addr: &str,
+    a_addr: PeerInfo,
+    b_addr: PeerInfo,
+    node_id: i32,
+    sender: SyncSender<InternalMsg>,
+    receiver: Receiver<InternalMsg>,
+) {
     thread::spawn(move || {
         raft_main(a_addr, b_addr, receiver, node_id);
     });
@@ -476,7 +518,7 @@ fn raft_listen_main(self_addr: &str, a_addr: PeerInfo, b_addr: PeerInfo, node_id
             Ok((stream, addr)) => {
                 println!("{}: Accepted {}!", self_addr, addr);
                 let sender = sender.clone();
-                thread::spawn(move || match handle_peer_msg(stream, sender) {
+                thread::spawn(move || match handle_peer_conn(stream, sender) {
                     Err(e) => println!("Error occur handling {:?}", e),
                     _ => (),
                 });
@@ -540,20 +582,17 @@ fn main() -> std::io::Result<()> {
     }
     set_self_addr(self_addr);
 
+    let (sender, receiver) = sync_channel(1000000);
+    let peer_sender = sender.clone();
     thread::spawn(move || {
-        raft_listen_main(self_addr, a_addr, b_addr, node_id);
-    });
-
-    let (cmd_sender, cmd_receiver) = sync_channel(1000);
-    thread::spawn(move || {
-        exec(cmd_receiver);
+        raft_listen_main(self_addr, a_addr, b_addr, node_id, peer_sender, receiver);
     });
 
     let listener = TcpListener::bind(cmd_addr)?;
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let cmd_sender = cmd_sender.clone();
+                let cmd_sender = sender.clone();
                 thread::spawn(move || match handle_client(stream, cmd_sender) {
                     Err(e) => println!("Error occur handling {:?}", e),
                     _ => (),

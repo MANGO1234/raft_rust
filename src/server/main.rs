@@ -86,11 +86,18 @@ pub enum CltMsgResp {
     Err(String),
 }
 
-struct Peer {
+struct RaftCtx {
     node_id: NodeId,
-    addr: SocketAddr,
-    last_contact: Instant,
-    sender: SyncSender<PeerMsg>,
+    state: SvrState,
+    term: u64,
+    peers: HashMap<NodeId, Peer>,
+    log: Log,
+}
+
+struct Log {
+    records: Vec<Record>,
+    map: HashMap<Arc<String>, Arc<String>>,
+    latest_index: u64,
 }
 
 struct Record {
@@ -100,110 +107,11 @@ struct Record {
     val: Arc<String>,
 }
 
-struct Log {
-    records: Vec<Record>,
-    map: HashMap<Arc<String>, Arc<String>>,
-    latest_index: u64,
-}
-
-fn handle_client(mut stream: TcpStream, cmd_sender: SyncSender<InternalMsg>) -> Result<()> {
-    println!("handling cmd from {}", stream.peer_addr().unwrap());
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-
-    let mut buf = [0u8; 4];
-    stream.read_exact(&mut buf)?;
-    let size =
-        buf[0] as u32 + ((buf[1] as u32) << 8) + ((buf[2] as u32) << 16) + ((buf[3] as u32) << 24);
-    let mut cmd_buf = vec![0u8; size as usize];
-    stream.read_exact(cmd_buf.as_mut_slice())?;
-
-    let cmd_str = String::from_utf8(cmd_buf)?;
-    let cmd: SvrMsgCmd = serde_json::from_str(cmd_str.as_str())?;
-    println!("handling cmd {:?}", cmd);
-    let (sender, receiver) = sync_channel(1);
-    let mut clt_resp = None;
-    if let Ok(_) = cmd_sender.send(InternalMsg::Clt(cmd, sender)) {
-        if let Ok(InternalMsg::CltResp(resp)) = receiver.recv() {
-            clt_resp = Some(resp);
-        }
-    };
-    let resp = if let Some(clt_resp) = &clt_resp {
-        match clt_resp {
-            CltMsgResp::Ok => SvrMsgResp::Ok,
-            CltMsgResp::Empty => SvrMsgResp::Empty,
-            CltMsgResp::Err(msg) => SvrMsgResp::Err(msg.as_str()),
-            CltMsgResp::Val(msg) => SvrMsgResp::Err(msg.as_str()),
-        }
-    } else {
-        SvrMsgResp::Err("Internal Error")
-    };
-    stream.write(serde_json::to_string(&resp).unwrap().as_bytes())?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn send_string(stream: &mut TcpStream, msg: String) -> std::io::Result<()> {
-    let len = msg.as_bytes().len() as u32;
-    let t = [
-        len as u8,
-        (len >> 8) as u8,
-        (len >> 16) as u8,
-        (len >> 24) as u8,
-    ];
-    stream.write(&t)?;
-    stream.write(msg.as_bytes())?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn raft_peer_sender(peer_addr: SocketAddr, receiver: Receiver<PeerMsg>) {
-    let mut stream = None;
-    loop {
-        if let None = stream {
-            match TcpStream::connect_timeout(&peer_addr, Duration::from_secs(1)) {
-                Ok(s) => {
-                    if let Ok(_) = s.set_write_timeout(Some(Duration::from_secs(2))) {
-                        stream = Some(s)
-                    }
-                }
-                Err(e) => println!("Error connecting to {} {}", peer_addr, e),
-            }
-        }
-        if let Some(ref mut st) = stream {
-            if let Ok(msg) = receiver.recv_timeout(Duration::from_secs(1)) {
-                let msg = serde_json::to_string(&msg).unwrap();
-                if let Err(e) = send_string(st, msg) {
-                    println!("{}: Error sending to {} {}", get_self_addr(), peer_addr, e);
-                    stream = None;
-                }
-            }
-        } else {
-            sleep(Duration::from_millis(300));
-        }
-    }
-}
-
-fn handle_peer_conn(mut stream: TcpStream, sender: SyncSender<InternalMsg>) -> Result<()> {
-    loop {
-        let mut buf = [0u8; 4];
-        stream.read_exact(&mut buf)?;
-        let size = buf[0] as u32
-            + ((buf[1] as u32) << 8)
-            + ((buf[2] as u32) << 16)
-            + ((buf[3] as u32) << 24);
-        let mut msg = vec![0u8; size as usize];
-        stream.read_exact(msg.as_mut_slice())?;
-        let str = String::from_utf8(msg)?;
-        let msg: PeerMsg = serde_json::from_str(str.as_str())?;
-        let _ = sender.send(InternalMsg::Peer(msg));
-        println!(
-            "{}: received from {} {}",
-            get_self_addr(),
-            stream.peer_addr().unwrap(),
-            str
-        );
-    }
+struct Peer {
+    node_id: NodeId,
+    addr: SocketAddr,
+    last_contact: Instant,
+    sender: SyncSender<PeerMsg>,
 }
 
 impl RaftCtx {
@@ -262,39 +170,201 @@ struct PeerInfo {
     node_id: NodeId,
 }
 
-fn broadcast_request_vote_msg(peers: &mut HashMap<NodeId, Peer>, term: u64, node_id: NodeId) {
-    for (_, peer) in peers {
-        let _ = peer.sender.send(PeerMsg::RequestVote {
-            term,
-            node_id,
-            last_log_idx: 0,
-        });
+fn main() -> std::io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() == 1 {
+        println!("[1|2|3]");
+        return Ok(());
+    }
+
+    let cmd_addr;
+    let self_addr;
+    let a_addr;
+    let b_addr;
+    let node_id;
+    if args[1].as_str() == "1" {
+        self_addr = "127.0.0.1:10001";
+        a_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10002").unwrap(),
+            node_id: 2,
+        };
+        b_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10003").unwrap(),
+            node_id: 3,
+        };
+        cmd_addr = "127.0.0.1:12001";
+        node_id = 1;
+    } else if args[1].as_str() == "2" {
+        self_addr = "127.0.0.1:10002";
+        a_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10001").unwrap(),
+            node_id: 1,
+        };
+        b_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10003").unwrap(),
+            node_id: 3,
+        };
+        cmd_addr = "127.0.0.1:12002";
+        node_id = 2;
+    } else if args[1].as_str() == "3" {
+        self_addr = "127.0.0.1:10003";
+        a_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10001").unwrap(),
+            node_id: 1,
+        };
+        b_addr = PeerInfo {
+            addr: SocketAddr::from_str("127.0.0.1:10002").unwrap(),
+            node_id: 2,
+        };
+        cmd_addr = "127.0.0.1:12003";
+        node_id = 3;
+    } else {
+        println!("[1|2|3]");
+        return Ok(());
+    }
+    set_self_addr(self_addr);
+
+    let (sender, receiver) = sync_channel(1000000);
+    let peer_sender = sender.clone();
+    thread::spawn(move || {
+        raft_listen_main(self_addr, a_addr, b_addr, node_id, peer_sender, receiver);
+    });
+
+    let listener = TcpListener::bind(cmd_addr)?;
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let cmd_sender = sender.clone();
+                thread::spawn(move || match handle_client(stream, cmd_sender) {
+                    Err(e) => println!("Error occur handling {:?}", e),
+                    _ => (),
+                });
+            }
+            Err(e) => println!("Error occur accepting {:?}", e),
+        }
+    }
+    Ok(())
+}
+
+// I was going to try async io, then realize the design would be similar to threaded io anyway
+// so just going to do that instead
+fn raft_listen_main(
+    self_addr: &str,
+    a_addr: PeerInfo,
+    b_addr: PeerInfo,
+    node_id: i32,
+    sender: SyncSender<InternalMsg>,
+    receiver: Receiver<InternalMsg>,
+) {
+    thread::spawn(move || {
+        raft_main(a_addr, b_addr, receiver, node_id);
+    });
+
+    let listener;
+    loop {
+        let l = TcpListener::bind(self_addr);
+        if let Err(e) = l {
+            println!("Error while binding to {}: {}", self_addr, e);
+        } else {
+            listener = l.unwrap();
+            break;
+        }
+        sleep(Duration::from_secs(1));
+    }
+    loop {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                println!("{}: Accepted {}!", self_addr, addr);
+                let sender = sender.clone();
+                thread::spawn(move || match handle_peer_conn(stream, sender) {
+                    Err(e) => println!("Error occur handling {:?}", e),
+                    _ => (),
+                });
+            }
+            Err(e) => println!("{}: Error occur accepting {:?}", self_addr, e),
+        }
     }
 }
 
-fn send_request_vote_resp_msg(ctx: &mut RaftCtx, peer_node_id: NodeId, vote_granted: bool) {
-    let term = ctx.term;
-    let node_id = ctx.node_id;
-    let peer = ctx.find_peer_mut(peer_node_id);
-    if let Some(peer) = peer {
-        let _ = peer.sender.send(PeerMsg::RequestVoteResp {
-            node_id,
-            term,
-            vote_granted,
-        });
+fn raft_main(
+    a_addr: PeerInfo,
+    b_addr: PeerInfo,
+    msg_receiver: Receiver<InternalMsg>,
+    node_id: i32,
+) {
+    let mut ctx = RaftCtx {
+        node_id,
+        state: SvrState::Follower {
+            leader: None,
+            leader_last_contact: Instant::now(),
+        },
+        term: 0,
+        peers: HashMap::new(),
+        log: Log {
+            latest_index: 0,
+            records: Vec::new(),
+            map: HashMap::new(),
+        },
+    };
+
+    ctx.add_peer(a_addr.node_id, a_addr.addr);
+    ctx.add_peer(b_addr.node_id, b_addr.addr);
+
+    let mut last_print_state = Instant::now();
+    loop {
+        if last_print_state.elapsed().as_millis() >= 1000 {
+            println!("{}: {:?}", get_self_addr(), ctx.state);
+            last_print_state = Instant::now();
+        }
+        match msg_receiver.recv_timeout(Duration::from_millis(400)) {
+            Ok(msg) => match msg {
+                InternalMsg::Peer(peer_msg) => {
+                    handle_peer_msg(&mut ctx, peer_msg);
+                }
+                InternalMsg::Clt(cmd, sender) => {
+                    handle_clt_msg(&mut ctx, cmd, sender);
+                }
+                _ => (),
+            },
+            Err(_) => (),
+        }
+
+        match ctx.state {
+            SvrState::Leader {
+                ref mut last_heart_beat,
+            } => {
+                if last_heart_beat.elapsed().as_millis() >= 500 {
+                    for (_, peer) in &mut ctx.peers {
+                        send_heartbeat_msg(peer, ctx.term, ctx.node_id);
+                    }
+                    *last_heart_beat = Instant::now();
+                }
+            }
+            SvrState::Follower {
+                leader_last_contact,
+                ..
+            } => {
+                if leader_last_contact.elapsed().as_millis() >= 5000 {
+                    ctx.to_candidate();
+                    broadcast_request_vote_msg(&mut ctx.peers, ctx.term, ctx.node_id);
+                }
+            }
+            SvrState::Candidate {
+                first_req_vote,
+                ref mut last_req_vote,
+                election_timeout,
+                ..
+            } => {
+                if first_req_vote.elapsed() >= election_timeout {
+                    ctx.to_candidate();
+                    broadcast_request_vote_msg(&mut ctx.peers, ctx.term, ctx.node_id);
+                } else if last_req_vote.elapsed().as_millis() >= 500 {
+                    broadcast_request_vote_msg(&mut ctx.peers, ctx.term, ctx.node_id);
+                    *last_req_vote = Instant::now();
+                }
+            }
+        }
     }
-}
-
-fn send_heartbeat_msg(peer: &mut Peer, term: u64, node_id: NodeId) {
-    let _ = peer.sender.send(PeerMsg::HeartBeat { node_id, term });
-}
-
-struct RaftCtx {
-    node_id: NodeId,
-    state: SvrState,
-    term: u64,
-    peers: HashMap<NodeId, Peer>,
-    log: Log,
 }
 
 fn handle_peer_msg(ctx: &mut RaftCtx, msg: PeerMsg) {
@@ -407,199 +477,129 @@ fn handle_clt_msg(ctx: &mut RaftCtx, cmd: SvrMsgCmd, resp_sender: SyncSender<Int
     }
 }
 
-fn raft_main(
-    a_addr: PeerInfo,
-    b_addr: PeerInfo,
-    msg_receiver: Receiver<InternalMsg>,
-    node_id: i32,
-) {
-    let mut ctx = RaftCtx {
-        node_id,
-        state: SvrState::Follower {
-            leader: None,
-            leader_last_contact: Instant::now(),
-        },
-        term: 0,
-        peers: HashMap::new(),
-        log: Log {
-            latest_index: 0,
-            records: Vec::new(),
-            map: HashMap::new(),
-        },
+fn broadcast_request_vote_msg(peers: &mut HashMap<NodeId, Peer>, term: u64, node_id: NodeId) {
+    for (_, peer) in peers {
+        let _ = peer.sender.send(PeerMsg::RequestVote {
+            term,
+            node_id,
+            last_log_idx: 0,
+        });
+    }
+}
+
+fn send_request_vote_resp_msg(ctx: &mut RaftCtx, peer_node_id: NodeId, vote_granted: bool) {
+    let term = ctx.term;
+    let node_id = ctx.node_id;
+    let peer = ctx.find_peer_mut(peer_node_id);
+    if let Some(peer) = peer {
+        let _ = peer.sender.send(PeerMsg::RequestVoteResp {
+            node_id,
+            term,
+            vote_granted,
+        });
+    }
+}
+
+fn send_heartbeat_msg(peer: &mut Peer, term: u64, node_id: NodeId) {
+    let _ = peer.sender.send(PeerMsg::HeartBeat { node_id, term });
+}
+
+fn handle_client(mut stream: TcpStream, cmd_sender: SyncSender<InternalMsg>) -> Result<()> {
+    println!("handling cmd from {}", stream.peer_addr().unwrap());
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf)?;
+    let size =
+        buf[0] as u32 + ((buf[1] as u32) << 8) + ((buf[2] as u32) << 16) + ((buf[3] as u32) << 24);
+    let mut cmd_buf = vec![0u8; size as usize];
+    stream.read_exact(cmd_buf.as_mut_slice())?;
+
+    let cmd_str = String::from_utf8(cmd_buf)?;
+    let cmd: SvrMsgCmd = serde_json::from_str(cmd_str.as_str())?;
+    println!("handling cmd {:?}", cmd);
+    let (sender, receiver) = sync_channel(1);
+    let mut clt_resp = None;
+    if let Ok(_) = cmd_sender.send(InternalMsg::Clt(cmd, sender)) {
+        if let Ok(InternalMsg::CltResp(resp)) = receiver.recv() {
+            clt_resp = Some(resp);
+        }
     };
-
-    ctx.add_peer(a_addr.node_id, a_addr.addr);
-    ctx.add_peer(b_addr.node_id, b_addr.addr);
-
-    let mut last_print_state = Instant::now();
-    loop {
-        if last_print_state.elapsed().as_millis() >= 1000 {
-            println!("{}: {:?}", get_self_addr(), ctx.state);
-            last_print_state = Instant::now();
+    let resp = if let Some(clt_resp) = &clt_resp {
+        match clt_resp {
+            CltMsgResp::Ok => SvrMsgResp::Ok,
+            CltMsgResp::Empty => SvrMsgResp::Empty,
+            CltMsgResp::Err(msg) => SvrMsgResp::Err(msg.as_str()),
+            CltMsgResp::Val(msg) => SvrMsgResp::Err(msg.as_str()),
         }
-        match msg_receiver.recv_timeout(Duration::from_millis(400)) {
-            Ok(msg) => match msg {
-                InternalMsg::Peer(peer_msg) => {
-                    handle_peer_msg(&mut ctx, peer_msg);
-                }
-                InternalMsg::Clt(cmd, sender) => {
-                    handle_clt_msg(&mut ctx, cmd, sender);
-                }
-                _ => (),
-            },
-            Err(_) => (),
-        }
-
-        match ctx.state {
-            SvrState::Leader {
-                ref mut last_heart_beat,
-            } => {
-                if last_heart_beat.elapsed().as_millis() >= 500 {
-                    for (_, peer) in &mut ctx.peers {
-                        send_heartbeat_msg(peer, ctx.term, ctx.node_id);
-                    }
-                    *last_heart_beat = Instant::now();
-                }
-            }
-            SvrState::Follower {
-                leader_last_contact,
-                ..
-            } => {
-                if leader_last_contact.elapsed().as_millis() >= 5000 {
-                    ctx.to_candidate();
-                    broadcast_request_vote_msg(&mut ctx.peers, ctx.term, ctx.node_id);
-                }
-            }
-            SvrState::Candidate {
-                first_req_vote,
-                ref mut last_req_vote,
-                election_timeout,
-                ..
-            } => {
-                if first_req_vote.elapsed() >= election_timeout {
-                    ctx.to_candidate();
-                    broadcast_request_vote_msg(&mut ctx.peers, ctx.term, ctx.node_id);
-                } else if last_req_vote.elapsed().as_millis() >= 500 {
-                    broadcast_request_vote_msg(&mut ctx.peers, ctx.term, ctx.node_id);
-                    *last_req_vote = Instant::now();
-                }
-            }
-        }
-    }
-}
-
-// I was going to try async io, then realize the design would be similar to threaded io anyway
-// so just going to do that instead
-fn raft_listen_main(
-    self_addr: &str,
-    a_addr: PeerInfo,
-    b_addr: PeerInfo,
-    node_id: i32,
-    sender: SyncSender<InternalMsg>,
-    receiver: Receiver<InternalMsg>,
-) {
-    thread::spawn(move || {
-        raft_main(a_addr, b_addr, receiver, node_id);
-    });
-
-    let listener;
-    loop {
-        let l = TcpListener::bind(self_addr);
-        if let Err(e) = l {
-            println!("Error while binding to {}: {}", self_addr, e);
-        } else {
-            listener = l.unwrap();
-            break;
-        }
-        sleep(Duration::from_secs(1));
-    }
-    loop {
-        match listener.accept() {
-            Ok((stream, addr)) => {
-                println!("{}: Accepted {}!", self_addr, addr);
-                let sender = sender.clone();
-                thread::spawn(move || match handle_peer_conn(stream, sender) {
-                    Err(e) => println!("Error occur handling {:?}", e),
-                    _ => (),
-                });
-            }
-            Err(e) => println!("{}: Error occur accepting {:?}", self_addr, e),
-        }
-    }
-}
-
-fn main() -> std::io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() == 1 {
-        println!("[1|2|3]");
-        return Ok(());
-    }
-
-    let cmd_addr;
-    let self_addr;
-    let a_addr;
-    let b_addr;
-    let node_id;
-    if args[1].as_str() == "1" {
-        self_addr = "127.0.0.1:10001";
-        a_addr = PeerInfo {
-            addr: SocketAddr::from_str("127.0.0.1:10002").unwrap(),
-            node_id: 2,
-        };
-        b_addr = PeerInfo {
-            addr: SocketAddr::from_str("127.0.0.1:10003").unwrap(),
-            node_id: 3,
-        };
-        cmd_addr = "127.0.0.1:12001";
-        node_id = 1;
-    } else if args[1].as_str() == "2" {
-        self_addr = "127.0.0.1:10002";
-        a_addr = PeerInfo {
-            addr: SocketAddr::from_str("127.0.0.1:10001").unwrap(),
-            node_id: 1,
-        };
-        b_addr = PeerInfo {
-            addr: SocketAddr::from_str("127.0.0.1:10003").unwrap(),
-            node_id: 3,
-        };
-        cmd_addr = "127.0.0.1:12002";
-        node_id = 2;
-    } else if args[1].as_str() == "3" {
-        self_addr = "127.0.0.1:10003";
-        a_addr = PeerInfo {
-            addr: SocketAddr::from_str("127.0.0.1:10001").unwrap(),
-            node_id: 1,
-        };
-        b_addr = PeerInfo {
-            addr: SocketAddr::from_str("127.0.0.1:10002").unwrap(),
-            node_id: 2,
-        };
-        cmd_addr = "127.0.0.1:12003";
-        node_id = 3;
     } else {
-        println!("[1|2|3]");
-        return Ok(());
-    }
-    set_self_addr(self_addr);
+        SvrMsgResp::Err("Internal Error")
+    };
+    stream.write(serde_json::to_string(&resp).unwrap().as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
 
-    let (sender, receiver) = sync_channel(1000000);
-    let peer_sender = sender.clone();
-    thread::spawn(move || {
-        raft_listen_main(self_addr, a_addr, b_addr, node_id, peer_sender, receiver);
-    });
-
-    let listener = TcpListener::bind(cmd_addr)?;
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let cmd_sender = sender.clone();
-                thread::spawn(move || match handle_client(stream, cmd_sender) {
-                    Err(e) => println!("Error occur handling {:?}", e),
-                    _ => (),
-                });
+fn raft_peer_sender(peer_addr: SocketAddr, receiver: Receiver<PeerMsg>) {
+    let mut stream = None;
+    loop {
+        if let None = stream {
+            match TcpStream::connect_timeout(&peer_addr, Duration::from_secs(1)) {
+                Ok(s) => {
+                    if let Ok(_) = s.set_write_timeout(Some(Duration::from_secs(2))) {
+                        stream = Some(s)
+                    }
+                }
+                Err(e) => println!("Error connecting to {} {}", peer_addr, e),
             }
-            Err(e) => println!("Error occur accepting {:?}", e),
+        }
+        if let Some(ref mut st) = stream {
+            if let Ok(msg) = receiver.recv_timeout(Duration::from_secs(1)) {
+                let msg = serde_json::to_string(&msg).unwrap();
+                if let Err(e) = send_string(st, msg) {
+                    println!("{}: Error sending to {} {}", get_self_addr(), peer_addr, e);
+                    stream = None;
+                }
+            }
+        } else {
+            sleep(Duration::from_millis(300));
         }
     }
+}
+
+fn handle_peer_conn(mut stream: TcpStream, sender: SyncSender<InternalMsg>) -> Result<()> {
+    loop {
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf)?;
+        let size = buf[0] as u32
+            + ((buf[1] as u32) << 8)
+            + ((buf[2] as u32) << 16)
+            + ((buf[3] as u32) << 24);
+        let mut msg = vec![0u8; size as usize];
+        stream.read_exact(msg.as_mut_slice())?;
+        let str = String::from_utf8(msg)?;
+        let msg: PeerMsg = serde_json::from_str(str.as_str())?;
+        let _ = sender.send(InternalMsg::Peer(msg));
+        println!(
+            "{}: received from {} {}",
+            get_self_addr(),
+            stream.peer_addr().unwrap(),
+            str
+        );
+    }
+}
+
+fn send_string(stream: &mut TcpStream, msg: String) -> std::io::Result<()> {
+    let len = msg.as_bytes().len() as u32;
+    let t = [
+        len as u8,
+        (len >> 8) as u8,
+        (len >> 16) as u8,
+        (len >> 24) as u8,
+    ];
+    stream.write(&t)?;
+    stream.write(msg.as_bytes())?;
+    stream.flush()?;
     Ok(())
 }

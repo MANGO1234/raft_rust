@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde::Serialize;
+use std::net::SocketAddr;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SvrMsgCmd {
@@ -12,5 +13,7 @@ pub enum SvrMsgResp<'a> {
     Val(&'a str),
     Empty,
     Ok,
+    Redirect(SocketAddr),
+    Unavailable,
     Err(&'a str),
 }

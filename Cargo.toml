@@ -16,6 +16,10 @@ path = "src/server/main.rs"
 name = "client"
 path = "src/client/main.rs"
 
+[[bin]]
+name = "debug_client"
+path = "src/server/debug.rs"
+
 [profile.dev]
 panic = "abort"
 

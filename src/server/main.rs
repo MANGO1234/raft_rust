@@ -1,12 +1,16 @@
+mod debug;
 mod error;
 
+use debug::DebugMsg;
 use error::Result;
-use raft_rust::common::{SvrMsgCmd, SvrMsgResp};
+use raft_rust::common::{send_string, SvrMsgCmd, SvrMsgResp};
 use rand::{thread_rng, Rng};
+use serde::export::fmt::Debug;
 use serde::export::Option::Some;
 use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::ops::Sub;
@@ -89,6 +93,7 @@ enum PeerMsg {
         node_id: NodeId,
         term: u64,
         last_log_idx: u64,
+        last_log_term: u64,
     },
     RequestVoteResp {
         node_id: NodeId,
@@ -100,8 +105,8 @@ enum PeerMsg {
 #[derive(Debug)]
 enum InternalMsg {
     Peer(PeerMsg),
-    Clt(SvrMsgCmd, SyncSender<InternalMsg>),
-    CltResp(CltMsgResp),
+    Debug(DebugMsg),
+    Clt(SvrMsgCmd, SyncSender<CltMsgResp>),
 }
 
 #[derive(Debug)]
@@ -147,6 +152,15 @@ impl Log {
         }
     }
 
+    fn last_info(&self) -> (u64, u64) {
+        if self.records.len() == 0 {
+            (0, 0)
+        } else {
+            let record = self.records.last().unwrap();
+            (record.index, record.term)
+        }
+    }
+
     fn del_greater_or_equal_idx(&mut self, idx: u64) {
         while self.records.len() >= idx as usize {
             if let None = self.records.pop() {
@@ -156,13 +170,20 @@ impl Log {
         self.latest_index = min(self.latest_index, idx);
     }
 
-    fn insert_new(&mut self, key: Arc<String>, val: Arc<String>, term: u64) {
+    fn insert_new(
+        &mut self,
+        key: Arc<String>,
+        val: Arc<String>,
+        term: u64,
+        resp_sender: Option<SyncSender<CltMsgResp>>,
+    ) {
         self.latest_index += 1;
         let record = Record {
             index: self.latest_index,
             term,
             key: key,
             val: val,
+            resp_sender,
         };
         self.records.push(record);
     }
@@ -173,34 +194,35 @@ impl Log {
                 self.del_greater_or_equal_idx(idx);
             }
         }
-        self.insert_new(key, val, term);
+        self.insert_new(key, val, term, None);
     }
 
     fn commit_up_to(&mut self, idx: u64) {
         if idx > self.latest_commit {
-            for i in self.latest_index..idx {
-                let record = &self.records[i as usize];
+            for i in self.latest_index..=idx {
+                let record = &mut self.records[(i - 1) as usize];
                 self.map.insert(record.key.clone(), record.val.clone());
+                if let Some(resp_sender) = &record.resp_sender {
+                    let _ = resp_sender.try_send(CltMsgResp::Ok);
+                    record.resp_sender = None;
+                }
             }
             self.latest_commit = idx;
         }
     }
-
-    // fn get_key(&self, key: Strin) -> Option(&Arc<String>) {
-    //     return self.map.get(key);
-    // }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug)]
 struct Record {
     index: u64,
     term: u64,
     key: Arc<String>,
     val: Arc<String>,
+    resp_sender: Option<SyncSender<CltMsgResp>>,
 }
 
 struct Peer {
-    node_id: NodeId,
+    pub_addr: SocketAddr,
     addr: SocketAddr,
     sender: SyncSender<PeerMsg>,
     match_idx: u64,
@@ -208,11 +230,11 @@ struct Peer {
 }
 
 impl RaftCtx {
-    fn add_peer(&mut self, node_id: NodeId, addr: SocketAddr) {
+    fn add_peer(&mut self, node_id: NodeId, addr: SocketAddr, pub_addr: SocketAddr) {
         let (sender, receiver) = sync_channel(10000);
         let peer = Peer {
-            node_id: node_id,
             addr: addr,
+            pub_addr: pub_addr,
             sender: sender,
             match_idx: 0,
             next_idx: 1,
@@ -261,6 +283,7 @@ impl RaftCtx {
 
 struct PeerInfo {
     addr: SocketAddr,
+    pub_addr: SocketAddr,
     node_id: NodeId,
 }
 
@@ -280,10 +303,12 @@ fn main() -> std::io::Result<()> {
         self_addr = "127.0.0.1:10001";
         a_addr = PeerInfo {
             addr: SocketAddr::from_str("127.0.0.1:10002").unwrap(),
+            pub_addr: SocketAddr::from_str("127.0.0.1:12002").unwrap(),
             node_id: 2,
         };
         b_addr = PeerInfo {
             addr: SocketAddr::from_str("127.0.0.1:10003").unwrap(),
+            pub_addr: SocketAddr::from_str("127.0.0.1:12003").unwrap(),
             node_id: 3,
         };
         cmd_addr = "127.0.0.1:12001";
@@ -292,10 +317,12 @@ fn main() -> std::io::Result<()> {
         self_addr = "127.0.0.1:10002";
         a_addr = PeerInfo {
             addr: SocketAddr::from_str("127.0.0.1:10001").unwrap(),
+            pub_addr: SocketAddr::from_str("127.0.0.1:12001").unwrap(),
             node_id: 1,
         };
         b_addr = PeerInfo {
             addr: SocketAddr::from_str("127.0.0.1:10003").unwrap(),
+            pub_addr: SocketAddr::from_str("127.0.0.1:12003").unwrap(),
             node_id: 3,
         };
         cmd_addr = "127.0.0.1:12002";
@@ -304,10 +331,12 @@ fn main() -> std::io::Result<()> {
         self_addr = "127.0.0.1:10003";
         a_addr = PeerInfo {
             addr: SocketAddr::from_str("127.0.0.1:10001").unwrap(),
+            pub_addr: SocketAddr::from_str("127.0.0.1:12001").unwrap(),
             node_id: 1,
         };
         b_addr = PeerInfo {
             addr: SocketAddr::from_str("127.0.0.1:10002").unwrap(),
+            pub_addr: SocketAddr::from_str("127.0.0.1:12002").unwrap(),
             node_id: 2,
         };
         cmd_addr = "127.0.0.1:12003";
@@ -370,7 +399,7 @@ fn raft_listen_main(
             Ok((stream, addr)) => {
                 println!("{}: Accepted {}!", self_addr, addr);
                 let sender = sender.clone();
-                thread::spawn(move || match handle_peer_conn(stream, sender) {
+                thread::spawn(move || match handle_peer_conn(stream, sender, node_id) {
                     Err(e) => println!("Error occur handling {:?}", e),
                     _ => (),
                 });
@@ -397,12 +426,12 @@ fn raft_main(
         log: Log::new(),
     };
 
-    ctx.add_peer(a_addr.node_id, a_addr.addr);
-    ctx.add_peer(b_addr.node_id, b_addr.addr);
+    ctx.add_peer(a_addr.node_id, a_addr.addr, a_addr.pub_addr);
+    ctx.add_peer(b_addr.node_id, b_addr.addr, b_addr.pub_addr);
 
     let mut last_print_state = Instant::now();
     loop {
-        if last_print_state.elapsed().as_millis() >= 2000 {
+        if last_print_state.elapsed().as_millis() >= 4000 {
             println!(
                 "{}: {:?} {} {}",
                 get_self_addr(),
@@ -417,10 +446,12 @@ fn raft_main(
                 InternalMsg::Peer(peer_msg) => {
                     handle_peer_msg(&mut ctx, peer_msg);
                 }
+                InternalMsg::Debug(debug_msg) => {
+                    handle_debug_msg(&ctx, debug_msg);
+                }
                 InternalMsg::Clt(cmd, sender) => {
                     handle_clt_msg(&mut ctx, cmd, sender);
                 }
-                _ => (),
             },
             Err(_) => (),
         }
@@ -442,7 +473,7 @@ fn raft_main(
             } => {
                 if leader_last_contact.elapsed().as_millis() >= 5000 {
                     ctx.to_candidate();
-                    broadcast_request_vote_msg(&ctx.peers, ctx.term, ctx.node_id);
+                    broadcast_request_vote_msg(&ctx.peers, &ctx.log, ctx.term, ctx.node_id);
                 }
             }
             SvrState::Candidate {
@@ -453,9 +484,9 @@ fn raft_main(
             } => {
                 if first_req_vote.elapsed() >= election_timeout {
                     ctx.to_candidate();
-                    broadcast_request_vote_msg(&ctx.peers, ctx.term, ctx.node_id);
+                    broadcast_request_vote_msg(&ctx.peers, &ctx.log, ctx.term, ctx.node_id);
                 } else if last_req_vote.elapsed().as_millis() >= 500 {
-                    broadcast_request_vote_msg(&ctx.peers, ctx.term, ctx.node_id);
+                    broadcast_request_vote_msg(&ctx.peers, &ctx.log, ctx.term, ctx.node_id);
                     *last_req_vote = Instant::now();
                 }
             }
@@ -528,15 +559,17 @@ fn handle_peer_msg(ctx: &mut RaftCtx, msg: PeerMsg) {
         PeerMsg::RequestVote {
             node_id,
             last_log_idx,
+            last_log_term,
             term,
         } => {
             if ctx.term < term {
+                let (self_last_log_idx, self_last_log_term) = ctx.log.last_info();
+                let vote = self_last_log_term < last_log_term
+                    || (self_last_log_term == last_log_term && self_last_log_idx <= last_log_idx);
                 ctx.to_follower(term, node_id);
-                send_request_vote_resp_msg(ctx, node_id, true);
-            } else if term == ctx.term {
-                send_request_vote_resp_msg(ctx, node_id, false);
+                send_request_vote_resp_msg(ctx, node_id, vote);
             } else {
-                // ignore, older leader's request
+                send_request_vote_resp_msg(ctx, node_id, false);
             }
         }
         PeerMsg::RequestVoteResp {
@@ -573,12 +606,17 @@ fn handle_peer_msg(ctx: &mut RaftCtx, msg: PeerMsg) {
                     peer.match_idx = match_idx;
                     peer.next_idx = next_idx;
                 }
-                send_append_entries_msg(ctx, node_id, success);
                 let mut matches: Vec<_> =
                     ctx.peers.iter().map(|(_, peer)| peer.match_idx).collect();
                 matches.sort();
                 let latest_commit = max(matches[(matches.len() + 1) / 2], ctx.log.latest_commit);
                 ctx.log.commit_up_to(latest_commit);
+
+                if let Some(peer) = ctx.find_peer(node_id) {
+                    if peer.next_idx <= ctx.log.latest_index {
+                        send_append_entries_msg(ctx, peer, success);
+                    }
+                }
             } else {
                 // ignore, older leader's response
             }
@@ -586,47 +624,66 @@ fn handle_peer_msg(ctx: &mut RaftCtx, msg: PeerMsg) {
     }
 }
 
-fn handle_clt_msg(ctx: &mut RaftCtx, cmd: SvrMsgCmd, resp_sender: SyncSender<InternalMsg>) {
+fn handle_debug_msg(ctx: &RaftCtx, msg: DebugMsg) {
+    match msg {
+        DebugMsg::SvrState => println!(
+            "{}: state={:?} term={} index={} commit={}",
+            ctx.node_id, ctx.state, ctx.term, ctx.log.latest_index, ctx.log.latest_commit
+        ),
+        DebugMsg::LogState => println!("{}: log={:?}", ctx.node_id, ctx.log.records),
+    }
+}
+
+fn handle_clt_msg(ctx: &mut RaftCtx, cmd: SvrMsgCmd, resp_sender: SyncSender<CltMsgResp>) {
     if let SvrState::Leader { .. } = ctx.state {
         match cmd {
             SvrMsgCmd::ValGet(key) => {
                 match ctx.log.map.get(&key.to_string()) {
                     Some(val) => {
-                        let _ = resp_sender
-                            .try_send(InternalMsg::CltResp(CltMsgResp::Val(val.clone())));
+                        let _ = resp_sender.try_send(CltMsgResp::Val(val.clone()));
                     }
                     None => {
-                        let _ = resp_sender.try_send(InternalMsg::CltResp(CltMsgResp::Empty));
+                        let _ = resp_sender.try_send(CltMsgResp::Empty);
                     }
                 };
             }
             SvrMsgCmd::ValSet(key, val) => {
-                ctx.log.insert_new(Arc::new(key), Arc::new(val), ctx.term);
-                let _ = resp_sender.try_send(InternalMsg::CltResp(CltMsgResp::Ok));
+                ctx.log
+                    .insert_new(Arc::new(key), Arc::new(val), ctx.term, Some(resp_sender));
+                for (_, peer) in &ctx.peers {
+                    send_append_entries_msg(ctx, peer, false);
+                }
             }
         }
-    }
-
-    let mut found = false;
-    if let SvrState::Follower { leader, .. } = ctx.state {
-        if let Some(leader) = leader {
-            if let Some(peer) = ctx.find_peer(leader) {
-                let _ = resp_sender.try_send(InternalMsg::CltResp(CltMsgResp::Redirect(peer.addr)));
-                found = true;
+    } else {
+        let mut found = false;
+        if let SvrState::Follower { leader, .. } = ctx.state {
+            if let Some(leader) = leader {
+                if let Some(peer) = ctx.find_peer(leader) {
+                    let _ = resp_sender.try_send(CltMsgResp::Redirect(peer.pub_addr));
+                    found = true;
+                }
             }
         }
-    }
-    if !found {
-        let _ = resp_sender.try_send(InternalMsg::CltResp(CltMsgResp::Unavailable));
+        if !found {
+            let _ = resp_sender.try_send(CltMsgResp::Unavailable);
+        }
     }
 }
 
-fn broadcast_request_vote_msg(peers: &HashMap<NodeId, Peer>, term: u64, node_id: NodeId) {
+fn broadcast_request_vote_msg(
+    peers: &HashMap<NodeId, Peer>,
+    log: &Log,
+    term: u64,
+    node_id: NodeId,
+) {
     for (_, peer) in peers {
+        let (last_log_idx, last_log_term) = log.last_info();
         let _ = peer.sender.send(PeerMsg::RequestVote {
             term,
             node_id,
-            last_log_idx: 0,
+            last_log_idx,
+            last_log_term,
         });
     }
 }
@@ -642,12 +699,7 @@ fn send_request_vote_resp_msg(ctx: &RaftCtx, peer_node_id: NodeId, vote_granted:
 }
 
 fn send_heartbeat_msg(ctx: &RaftCtx, peer: &Peer) {
-    let mut prev_log_idx = 0;
-    let mut prev_log_term = 0;
-    if ctx.log.records.len() > 0 {
-        prev_log_idx = ctx.log.records[ctx.log.records.len() - 1].index;
-        prev_log_term = ctx.log.records[ctx.log.records.len() - 1].term;
-    }
+    let (prev_log_idx, prev_log_term) = ctx.log.last_info();
     let _ = peer.sender.send(PeerMsg::AppendEntries {
         node_id: ctx.node_id,
         term: ctx.term,
@@ -658,44 +710,39 @@ fn send_heartbeat_msg(ctx: &RaftCtx, peer: &Peer) {
     });
 }
 
-fn send_append_entries_msg(ctx: &RaftCtx, peer_node_id: NodeId, all: bool) {
-    if let Some(peer) = ctx.find_peer(peer_node_id) {
-        let mut prev_log_idx = 0;
-        let mut prev_log_term = 0;
-        let mut start_idx = 1;
-        if peer.next_idx > 0 {
-            if let Some(record) = ctx.log.get_idx(peer.next_idx) {
-                prev_log_idx = record.index;
-                prev_log_term = record.term;
-            } else {
-                // done, can't find next_idx should mean no more records to send
-                return;
-            }
+fn send_append_entries_msg(ctx: &RaftCtx, peer: &Peer, all: bool) {
+    let mut prev_log_idx = 0;
+    let mut prev_log_term = 0;
+    let mut start_idx = 1;
+    if peer.next_idx > 1 {
+        if let Some(record) = ctx.log.get_idx(peer.next_idx - 1) {
+            prev_log_idx = record.index;
+            prev_log_term = record.term;
+        } else {
+            // something went wrong here
+            panic!();
         }
-        if peer.next_idx > 1 {
-            start_idx = peer.next_idx;
-        }
-
-        let _ = peer.sender.send(PeerMsg::AppendEntries {
-            node_id: ctx.node_id,
-            term: ctx.term,
-            prev_log_idx,
-            prev_log_term,
-            leader_commit_idx: ctx.log.latest_commit,
-            entries: if all {
-                let mut entries =
-                    Vec::with_capacity((ctx.log.latest_index - start_idx + 1) as usize);
-                for index in start_idx..=ctx.log.latest_index {
-                    // todo: use an iterator
-                    entries.push(ctx.log.get_idx(index).unwrap().into());
-                }
-                entries
-            } else {
-                let record = ctx.log.get_idx(start_idx).unwrap();
-                vec![record.into()]
-            },
-        });
+        start_idx = peer.next_idx;
     }
+
+    let _ = peer.sender.send(PeerMsg::AppendEntries {
+        node_id: ctx.node_id,
+        term: ctx.term,
+        prev_log_idx,
+        prev_log_term,
+        leader_commit_idx: ctx.log.latest_commit,
+        entries: if all {
+            let mut entries = Vec::with_capacity((ctx.log.latest_index - start_idx + 1) as usize);
+            for index in start_idx..=ctx.log.latest_index {
+                // todo: use an iterator
+                entries.push(ctx.log.get_idx(index).unwrap().into());
+            }
+            entries
+        } else {
+            let record = ctx.log.get_idx(start_idx).unwrap();
+            vec![record.into()]
+        },
+    });
 }
 
 fn send_append_entries_resp_msg(ctx: &RaftCtx, peer_node_id: NodeId, success: bool, next_idx: u64) {
@@ -728,7 +775,7 @@ fn handle_client(mut stream: TcpStream, cmd_sender: SyncSender<InternalMsg>) -> 
     let (sender, receiver) = sync_channel(1);
     let mut clt_resp = None;
     if let Ok(_) = cmd_sender.send(InternalMsg::Clt(cmd, sender)) {
-        if let Ok(InternalMsg::CltResp(resp)) = receiver.recv() {
+        if let Ok(resp) = receiver.recv() {
             clt_resp = Some(resp);
         }
     };
@@ -765,7 +812,7 @@ fn raft_peer_sender(peer_addr: SocketAddr, receiver: Receiver<PeerMsg>) {
         if let Some(ref mut st) = stream {
             if let Ok(msg) = receiver.recv_timeout(Duration::from_secs(1)) {
                 let msg = serde_json::to_string(&msg).unwrap();
-                if let Err(e) = send_string(st, msg) {
+                if let Err(e) = send_string(st, &msg) {
                     println!("{}: Error sending to {} {}", get_self_addr(), peer_addr, e);
                     stream = None;
                 }
@@ -776,7 +823,13 @@ fn raft_peer_sender(peer_addr: SocketAddr, receiver: Receiver<PeerMsg>) {
     }
 }
 
-fn handle_peer_conn(mut stream: TcpStream, sender: SyncSender<InternalMsg>) -> Result<()> {
+fn handle_peer_conn(
+    mut stream: TcpStream,
+    sender: SyncSender<InternalMsg>,
+    node_id: NodeId,
+) -> Result<()> {
+    let mut log_file = File::create(format!("F:/raft_{}.log", node_id))?;
+
     loop {
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf)?;
@@ -787,27 +840,19 @@ fn handle_peer_conn(mut stream: TcpStream, sender: SyncSender<InternalMsg>) -> R
         let mut msg = vec![0u8; size as usize];
         stream.read_exact(msg.as_mut_slice())?;
         let str = String::from_utf8(msg)?;
-        let msg: PeerMsg = serde_json::from_str(str.as_str())?;
-        let _ = sender.send(InternalMsg::Peer(msg));
-        println!(
-            "{}: received from {} {}",
-            get_self_addr(),
-            stream.peer_addr().unwrap(),
-            str
-        );
+        let msg = serde_json::from_str::<PeerMsg>(str.as_str());
+        match msg {
+            Ok(msg) => {
+                let _ = sender.send(InternalMsg::Peer(msg));
+                let _ = log_file.write_all(format!("{}: received {}\n", node_id, str).as_bytes());
+                let _ = log_file.flush();
+            }
+            Err(_) => {
+                let msg = serde_json::from_str::<DebugMsg>(str.as_str());
+                if let Ok(msg) = msg {
+                    let _ = sender.send(InternalMsg::Debug(msg));
+                }
+            }
+        }
     }
-}
-
-fn send_string(stream: &mut TcpStream, msg: String) -> std::io::Result<()> {
-    let len = msg.as_bytes().len() as u32;
-    let t = [
-        len as u8,
-        (len >> 8) as u8,
-        (len >> 16) as u8,
-        (len >> 24) as u8,
-    ];
-    stream.write(&t)?;
-    stream.write(msg.as_bytes())?;
-    stream.flush()?;
-    Ok(())
 }

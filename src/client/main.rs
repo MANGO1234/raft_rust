@@ -1,24 +1,33 @@
-use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::io::Read;
+use std::net::{SocketAddr, TcpStream};
 
-use raft_rust::common::SvrMsgCmd;
+use raft_rust::common::{send_string, SvrMsgCmd, SvrMsgResp};
+use std::str::FromStr;
+use std::thread::sleep;
+use std::time::Duration;
 
 fn run_cmd(cmd: SvrMsgCmd) -> std::io::Result<()> {
-    let mut stream = TcpStream::connect("127.0.0.1:12001")?;
-    let mut buf = String::new();
-    let cmd = serde_json::to_string(&cmd).unwrap();
-    let len = cmd.as_bytes().len() as u32;
-    let t = [
-        len as u8,
-        (len >> 8) as u8,
-        (len >> 16) as u8,
-        (len >> 24) as u8,
-    ];
-    stream.write(&t)?;
-    stream.write(cmd.as_bytes())?;
-    stream.flush()?;
-    stream.read_to_string(&mut buf)?;
-    println!("{}={}", cmd, buf);
+    let mut addr = SocketAddr::from_str("127.0.0.1:12001").unwrap();
+    loop {
+        let mut stream = TcpStream::connect(addr)?;
+        let cmd = serde_json::to_string(&cmd).unwrap();
+        send_string(&mut stream, &cmd)?;
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf)?;
+        println!("{}={}", cmd, buf);
+        let resp: SvrMsgResp = serde_json::from_str(buf.as_str()).unwrap();
+        match resp {
+            SvrMsgResp::Redirect(new_addr) => {
+                addr = new_addr;
+            }
+            SvrMsgResp::Unavailable => {
+                sleep(Duration::from_millis(2000));
+            }
+            _ => {
+                break;
+            }
+        }
+    }
     Ok(())
 }
 

@@ -1,6 +1,7 @@
 mod debug;
 mod error;
 
+use crossbeam::channel::{Receiver, Sender};
 use debug::DebugMsg;
 use error::Result;
 use raft_rust::common::{send_string, SvrMsgCmd, SvrMsgResp};
@@ -15,7 +16,6 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::ops::Sub;
 use std::str::FromStr;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -106,7 +106,7 @@ enum PeerMsg {
 enum InternalMsg {
     Peer(PeerMsg),
     Debug(DebugMsg),
-    Clt(SvrMsgCmd, SyncSender<CltMsgResp>),
+    Clt(SvrMsgCmd, Sender<CltMsgResp>),
 }
 
 #[derive(Debug)]
@@ -175,7 +175,7 @@ impl Log {
         key: Arc<String>,
         val: Arc<String>,
         term: u64,
-        resp_sender: Option<SyncSender<CltMsgResp>>,
+        resp_sender: Option<Sender<CltMsgResp>>,
     ) {
         self.latest_index += 1;
         let record = Record {
@@ -218,20 +218,20 @@ struct Record {
     term: u64,
     key: Arc<String>,
     val: Arc<String>,
-    resp_sender: Option<SyncSender<CltMsgResp>>,
+    resp_sender: Option<Sender<CltMsgResp>>,
 }
 
 struct Peer {
     pub_addr: SocketAddr,
     addr: SocketAddr,
-    sender: SyncSender<PeerMsg>,
+    sender: Sender<PeerMsg>,
     match_idx: u64,
     next_idx: u64,
 }
 
 impl RaftCtx {
     fn add_peer(&mut self, node_id: NodeId, addr: SocketAddr, pub_addr: SocketAddr) {
-        let (sender, receiver) = sync_channel(10000);
+        let (sender, receiver) = crossbeam::bounded(10000);
         let peer = Peer {
             addr: addr,
             pub_addr: pub_addr,
@@ -347,7 +347,7 @@ fn main() -> std::io::Result<()> {
     }
     set_self_addr(self_addr);
 
-    let (sender, receiver) = sync_channel(1000000);
+    let (sender, receiver) = crossbeam::bounded(1000000);
     let peer_sender = sender.clone();
     thread::spawn(move || {
         raft_listen_main(self_addr, a_addr, b_addr, node_id, peer_sender, receiver);
@@ -376,7 +376,7 @@ fn raft_listen_main(
     a_addr: PeerInfo,
     b_addr: PeerInfo,
     node_id: i32,
-    sender: SyncSender<InternalMsg>,
+    sender: Sender<InternalMsg>,
     receiver: Receiver<InternalMsg>,
 ) {
     thread::spawn(move || {
@@ -634,7 +634,7 @@ fn handle_debug_msg(ctx: &RaftCtx, msg: DebugMsg) {
     }
 }
 
-fn handle_clt_msg(ctx: &mut RaftCtx, cmd: SvrMsgCmd, resp_sender: SyncSender<CltMsgResp>) {
+fn handle_clt_msg(ctx: &mut RaftCtx, cmd: SvrMsgCmd, resp_sender: Sender<CltMsgResp>) {
     if let SvrState::Leader { .. } = ctx.state {
         match cmd {
             SvrMsgCmd::ValGet(key) => {
@@ -679,7 +679,7 @@ fn broadcast_request_vote_msg(
 ) {
     for (_, peer) in peers {
         let (last_log_idx, last_log_term) = log.last_info();
-        let _ = peer.sender.send(PeerMsg::RequestVote {
+        let _ = peer.sender.try_send(PeerMsg::RequestVote {
             term,
             node_id,
             last_log_idx,
@@ -690,7 +690,7 @@ fn broadcast_request_vote_msg(
 
 fn send_request_vote_resp_msg(ctx: &RaftCtx, peer_node_id: NodeId, vote_granted: bool) {
     if let Some(peer) = ctx.find_peer(peer_node_id) {
-        let _ = peer.sender.send(PeerMsg::RequestVoteResp {
+        let _ = peer.sender.try_send(PeerMsg::RequestVoteResp {
             node_id: ctx.node_id,
             term: ctx.term,
             vote_granted,
@@ -700,7 +700,7 @@ fn send_request_vote_resp_msg(ctx: &RaftCtx, peer_node_id: NodeId, vote_granted:
 
 fn send_heartbeat_msg(ctx: &RaftCtx, peer: &Peer) {
     let (prev_log_idx, prev_log_term) = ctx.log.last_info();
-    let _ = peer.sender.send(PeerMsg::AppendEntries {
+    let _ = peer.sender.try_send(PeerMsg::AppendEntries {
         node_id: ctx.node_id,
         term: ctx.term,
         prev_log_idx,
@@ -725,7 +725,7 @@ fn send_append_entries_msg(ctx: &RaftCtx, peer: &Peer, all: bool) {
         start_idx = peer.next_idx;
     }
 
-    let _ = peer.sender.send(PeerMsg::AppendEntries {
+    let _ = peer.sender.try_send(PeerMsg::AppendEntries {
         node_id: ctx.node_id,
         term: ctx.term,
         prev_log_idx,
@@ -747,7 +747,7 @@ fn send_append_entries_msg(ctx: &RaftCtx, peer: &Peer, all: bool) {
 
 fn send_append_entries_resp_msg(ctx: &RaftCtx, peer_node_id: NodeId, success: bool, next_idx: u64) {
     if let Some(peer) = ctx.find_peer(peer_node_id) {
-        let _ = peer.sender.send(PeerMsg::AppendEntriesResp {
+        let _ = peer.sender.try_send(PeerMsg::AppendEntriesResp {
             node_id: ctx.node_id,
             term: ctx.term,
             success,
@@ -757,7 +757,7 @@ fn send_append_entries_resp_msg(ctx: &RaftCtx, peer_node_id: NodeId, success: bo
     }
 }
 
-fn handle_client(mut stream: TcpStream, cmd_sender: SyncSender<InternalMsg>) -> Result<()> {
+fn handle_client(mut stream: TcpStream, cmd_sender: Sender<InternalMsg>) -> Result<()> {
     println!("handling cmd from {}", stream.peer_addr().unwrap());
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -772,7 +772,7 @@ fn handle_client(mut stream: TcpStream, cmd_sender: SyncSender<InternalMsg>) -> 
     let cmd_str = String::from_utf8(cmd_buf)?;
     let cmd: SvrMsgCmd = serde_json::from_str(cmd_str.as_str())?;
     println!("handling cmd {:?}", cmd);
-    let (sender, receiver) = sync_channel(1);
+    let (sender, receiver) = crossbeam::bounded(0);
     let mut clt_resp = None;
     if let Ok(_) = cmd_sender.send(InternalMsg::Clt(cmd, sender)) {
         if let Ok(resp) = receiver.recv() {
@@ -825,7 +825,7 @@ fn raft_peer_sender(peer_addr: SocketAddr, receiver: Receiver<PeerMsg>) {
 
 fn handle_peer_conn(
     mut stream: TcpStream,
-    sender: SyncSender<InternalMsg>,
+    sender: Sender<InternalMsg>,
     node_id: NodeId,
 ) -> Result<()> {
     let mut log_file = File::create(format!("F:/raft_{}.log", node_id))?;

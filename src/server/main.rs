@@ -1,15 +1,15 @@
 mod debug;
 mod error;
+mod log;
 
 use crossbeam::channel::{Receiver, Sender};
 use debug::DebugMsg;
 use error::Result;
+use log::{CltMsgResp, Log, Record};
 use raft_rust::common::{send_string, SvrMsgCmd, SvrMsgResp};
 use rand::{thread_rng, Rng};
-use serde::export::fmt::Debug;
-use serde::export::Option::Some;
 use serde::{Deserialize, Serialize};
-use std::cmp::{max, min};
+use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -109,116 +109,12 @@ enum InternalMsg {
     Clt(SvrMsgCmd, Sender<CltMsgResp>),
 }
 
-#[derive(Debug)]
-pub enum CltMsgResp {
-    Val(Arc<String>),
-    Empty,
-    Ok,
-    Redirect(SocketAddr),
-    Unavailable,
-    Err(String),
-}
-
 struct RaftCtx {
     node_id: NodeId,
     state: SvrState,
     term: u64,
     peers: HashMap<NodeId, Peer>,
     log: Log,
-}
-
-struct Log {
-    records: Vec<Record>,
-    map: HashMap<Arc<String>, Arc<String>>,
-    latest_index: u64,
-    latest_commit: u64,
-}
-
-impl Log {
-    fn new() -> Log {
-        return Log {
-            records: Vec::new(),
-            map: HashMap::new(),
-            latest_index: 0,
-            latest_commit: 0,
-        };
-    }
-
-    fn get_idx(&self, idx: u64) -> Option<&Record> {
-        if idx == 0 {
-            None
-        } else {
-            self.records.get((idx - 1) as usize)
-        }
-    }
-
-    fn last_info(&self) -> (u64, u64) {
-        if self.records.len() == 0 {
-            (0, 0)
-        } else {
-            let record = self.records.last().unwrap();
-            (record.index, record.term)
-        }
-    }
-
-    fn del_greater_or_equal_idx(&mut self, idx: u64) {
-        while self.records.len() >= idx as usize {
-            if let None = self.records.pop() {
-                break;
-            }
-        }
-        self.latest_index = min(self.latest_index, idx);
-    }
-
-    fn insert_new(
-        &mut self,
-        key: Arc<String>,
-        val: Arc<String>,
-        term: u64,
-        resp_sender: Option<Sender<CltMsgResp>>,
-    ) {
-        self.latest_index += 1;
-        let record = Record {
-            index: self.latest_index,
-            term,
-            key: key,
-            val: val,
-            resp_sender,
-        };
-        self.records.push(record);
-    }
-
-    fn insert_overwrite(&mut self, key: Arc<String>, val: Arc<String>, term: u64, idx: u64) {
-        if let Some(entry) = self.get_idx(idx) {
-            if entry.term != term {
-                self.del_greater_or_equal_idx(idx);
-            }
-        }
-        self.insert_new(key, val, term, None);
-    }
-
-    fn commit_up_to(&mut self, idx: u64) {
-        if idx > self.latest_commit {
-            for i in self.latest_index..=idx {
-                let record = &mut self.records[(i - 1) as usize];
-                self.map.insert(record.key.clone(), record.val.clone());
-                if let Some(resp_sender) = &record.resp_sender {
-                    let _ = resp_sender.try_send(CltMsgResp::Ok);
-                    record.resp_sender = None;
-                }
-            }
-            self.latest_commit = idx;
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Record {
-    index: u64,
-    term: u64,
-    key: Arc<String>,
-    val: Arc<String>,
-    resp_sender: Option<Sender<CltMsgResp>>,
 }
 
 struct Peer {
@@ -785,7 +681,6 @@ fn handle_client(mut stream: TcpStream, cmd_sender: Sender<InternalMsg>) -> Resu
             CltMsgResp::Empty => SvrMsgResp::Empty,
             CltMsgResp::Redirect(addr) => SvrMsgResp::Redirect(addr.clone()),
             CltMsgResp::Unavailable => SvrMsgResp::Unavailable,
-            CltMsgResp::Err(msg) => SvrMsgResp::Err(msg.as_str()),
             CltMsgResp::Val(msg) => SvrMsgResp::Err(msg.as_str()),
         }
     } else {

@@ -5,7 +5,7 @@ mod log;
 use crossbeam::channel::{Receiver, Sender};
 use debug::DebugMsg;
 use error::Result;
-use log::{CltMsgResp, Log, Record};
+use log::{CltMsgResp, Log, NodeId, Record};
 use raft_rust::common::{send_string, SvrMsgCmd, SvrMsgResp};
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
@@ -33,8 +33,6 @@ fn set_self_addr(s: &'static str) {
         SVR_ADDR = Some(s);
     }
 }
-
-type NodeId = i32;
 
 #[derive(Debug)]
 enum SvrState {
@@ -112,7 +110,6 @@ enum InternalMsg {
 struct RaftCtx {
     node_id: NodeId,
     state: SvrState,
-    term: u64,
     peers: HashMap<NodeId, Peer>,
     log: Log,
 }
@@ -151,7 +148,7 @@ impl RaftCtx {
     }
 
     fn to_candidate(&mut self) {
-        self.term += 1;
+        self.log.increment_term();
         let mut rng = thread_rng();
         self.state = SvrState::Candidate {
             voted: HashSet::new(),
@@ -166,7 +163,7 @@ impl RaftCtx {
             leader: Some(node_id),
             leader_last_contact: Instant::now(),
         };
-        self.term = term;
+        self.log.set_term(term, node_id);
     }
 
     fn to_leader(&mut self) {
@@ -195,6 +192,7 @@ fn main() -> std::io::Result<()> {
     let a_addr;
     let b_addr;
     let node_id;
+    let log_path;
     if args[1].as_str() == "1" {
         self_addr = "127.0.0.1:10001";
         a_addr = PeerInfo {
@@ -209,6 +207,7 @@ fn main() -> std::io::Result<()> {
         };
         cmd_addr = "127.0.0.1:12001";
         node_id = 1;
+        log_path = "F:/log_raft_1.txt";
     } else if args[1].as_str() == "2" {
         self_addr = "127.0.0.1:10002";
         a_addr = PeerInfo {
@@ -223,6 +222,7 @@ fn main() -> std::io::Result<()> {
         };
         cmd_addr = "127.0.0.1:12002";
         node_id = 2;
+        log_path = "F:/log_raft_2.txt";
     } else if args[1].as_str() == "3" {
         self_addr = "127.0.0.1:10003";
         a_addr = PeerInfo {
@@ -237,6 +237,7 @@ fn main() -> std::io::Result<()> {
         };
         cmd_addr = "127.0.0.1:12003";
         node_id = 3;
+        log_path = "F:/log_raft_3.txt";
     } else {
         println!("[1|2|3]");
         return Ok(());
@@ -246,7 +247,15 @@ fn main() -> std::io::Result<()> {
     let (sender, receiver) = crossbeam::bounded(1000000);
     let peer_sender = sender.clone();
     thread::spawn(move || {
-        raft_listen_main(self_addr, a_addr, b_addr, node_id, peer_sender, receiver);
+        raft_listen_main(
+            self_addr,
+            a_addr,
+            b_addr,
+            node_id,
+            log_path,
+            peer_sender,
+            receiver,
+        );
     });
 
     let listener = TcpListener::bind(cmd_addr)?;
@@ -271,12 +280,13 @@ fn raft_listen_main(
     self_addr: &str,
     a_addr: PeerInfo,
     b_addr: PeerInfo,
-    node_id: i32,
+    node_id: NodeId,
+    log_path: &'static str,
     sender: Sender<InternalMsg>,
     receiver: Receiver<InternalMsg>,
 ) {
     thread::spawn(move || {
-        raft_main(a_addr, b_addr, receiver, node_id);
+        raft_main(a_addr, b_addr, receiver, node_id, log_path);
     });
 
     let listener;
@@ -309,7 +319,8 @@ fn raft_main(
     a_addr: PeerInfo,
     b_addr: PeerInfo,
     msg_receiver: Receiver<InternalMsg>,
-    node_id: i32,
+    node_id: NodeId,
+    log_path: &str,
 ) {
     let mut ctx = RaftCtx {
         node_id,
@@ -317,15 +328,15 @@ fn raft_main(
             leader: None,
             leader_last_contact: Instant::now(),
         },
-        term: 0,
         peers: HashMap::new(),
-        log: Log::new(),
+        log: Log::new(log_path).unwrap(),
     };
 
     ctx.add_peer(a_addr.node_id, a_addr.addr, a_addr.pub_addr);
     ctx.add_peer(b_addr.node_id, b_addr.addr, b_addr.pub_addr);
 
     let mut last_print_state = Instant::now();
+    let mut last_flush_data = Instant::now();
     loop {
         if last_print_state.elapsed().as_millis() >= 4000 {
             println!(
@@ -369,7 +380,7 @@ fn raft_main(
             } => {
                 if leader_last_contact.elapsed().as_millis() >= 5000 {
                     ctx.to_candidate();
-                    broadcast_request_vote_msg(&ctx.peers, &ctx.log, ctx.term, ctx.node_id);
+                    broadcast_request_vote_msg(&ctx.peers, &ctx.log, ctx.log.term(), ctx.node_id);
                 }
             }
             SvrState::Candidate {
@@ -380,12 +391,18 @@ fn raft_main(
             } => {
                 if first_req_vote.elapsed() >= election_timeout {
                     ctx.to_candidate();
-                    broadcast_request_vote_msg(&ctx.peers, &ctx.log, ctx.term, ctx.node_id);
+                    broadcast_request_vote_msg(&ctx.peers, &ctx.log, ctx.log.term(), ctx.node_id);
                 } else if last_req_vote.elapsed().as_millis() >= 500 {
-                    broadcast_request_vote_msg(&ctx.peers, &ctx.log, ctx.term, ctx.node_id);
+                    broadcast_request_vote_msg(&ctx.peers, &ctx.log, ctx.log.term(), ctx.node_id);
                     *last_req_vote = Instant::now();
                 }
             }
+        }
+
+        if last_flush_data.elapsed().as_millis() >= 1000 {
+            let _ = ctx.log.file_flush_metadata_if_changed();
+            let _ = ctx.log.file_flush_records_if_err();
+            last_flush_data = Instant::now();
         }
     }
 }
@@ -400,9 +417,9 @@ fn handle_peer_msg(ctx: &mut RaftCtx, msg: PeerMsg) {
             leader_commit_idx,
             entries,
         } => {
-            if ctx.term < term {
+            if ctx.log.term() < term {
                 ctx.to_follower(term, node_id);
-            } else if ctx.term == term {
+            } else if ctx.log.term() == term {
                 if let SvrState::Candidate { .. } = ctx.state {
                     ctx.to_follower(term, node_id);
                 }
@@ -442,7 +459,7 @@ fn handle_peer_msg(ctx: &mut RaftCtx, msg: PeerMsg) {
                     for e in entries {
                         ctx.log.insert_overwrite(e.key, e.val, e.term, e.index);
                     }
-                    ctx.log.commit_up_to(leader_commit_idx);
+                    let _ = ctx.log.commit_up_to(leader_commit_idx);
                     send_append_entries_resp_msg(ctx, node_id, true, ctx.log.latest_index + 1);
                 } else {
                     // something went wrong with server logic
@@ -458,7 +475,7 @@ fn handle_peer_msg(ctx: &mut RaftCtx, msg: PeerMsg) {
             last_log_term,
             term,
         } => {
-            if ctx.term < term {
+            if ctx.log.term() < term {
                 let (self_last_log_idx, self_last_log_term) = ctx.log.last_info();
                 let vote = self_last_log_term < last_log_term
                     || (self_last_log_term == last_log_term && self_last_log_idx <= last_log_idx);
@@ -474,9 +491,9 @@ fn handle_peer_msg(ctx: &mut RaftCtx, msg: PeerMsg) {
             vote_granted,
         } => {
             if let SvrState::Candidate { voted, .. } = &mut ctx.state {
-                if ctx.term < term {
+                if ctx.log.term() < term {
                     ctx.to_follower(term, node_id);
-                } else if ctx.term == term {
+                } else if ctx.log.term() == term {
                     if vote_granted {
                         voted.insert(node_id);
                         if voted.len() >= (ctx.peers.len() + 1) / 2 {
@@ -495,9 +512,9 @@ fn handle_peer_msg(ctx: &mut RaftCtx, msg: PeerMsg) {
             next_idx,
             match_idx,
         } => {
-            if ctx.term < term {
+            if ctx.log.term() < term {
                 ctx.to_follower(term, node_id);
-            } else if ctx.term == term {
+            } else if ctx.log.term() == term {
                 if let Some(peer) = ctx.find_peer_mut(node_id) {
                     peer.match_idx = match_idx;
                     peer.next_idx = next_idx;
@@ -506,7 +523,7 @@ fn handle_peer_msg(ctx: &mut RaftCtx, msg: PeerMsg) {
                     ctx.peers.iter().map(|(_, peer)| peer.match_idx).collect();
                 matches.sort();
                 let latest_commit = max(matches[(matches.len() + 1) / 2], ctx.log.latest_commit);
-                ctx.log.commit_up_to(latest_commit);
+                let _ = ctx.log.commit_up_to(latest_commit);
 
                 if let Some(peer) = ctx.find_peer(node_id) {
                     if peer.next_idx <= ctx.log.latest_index {
@@ -524,7 +541,11 @@ fn handle_debug_msg(ctx: &RaftCtx, msg: DebugMsg) {
     match msg {
         DebugMsg::SvrState => println!(
             "{}: state={:?} term={} index={} commit={}",
-            ctx.node_id, ctx.state, ctx.term, ctx.log.latest_index, ctx.log.latest_commit
+            ctx.node_id,
+            ctx.state,
+            ctx.log.term(),
+            ctx.log.latest_index,
+            ctx.log.latest_commit
         ),
         DebugMsg::LogState => println!("{}: log={:?}", ctx.node_id, ctx.log.records),
     }
@@ -544,8 +565,12 @@ fn handle_clt_msg(ctx: &mut RaftCtx, cmd: SvrMsgCmd, resp_sender: Sender<CltMsgR
                 };
             }
             SvrMsgCmd::ValSet(key, val) => {
-                ctx.log
-                    .insert_new(Arc::new(key), Arc::new(val), ctx.term, Some(resp_sender));
+                ctx.log.insert_new(
+                    Arc::new(key),
+                    Arc::new(val),
+                    ctx.log.term(),
+                    Some(resp_sender),
+                );
                 for (_, peer) in &ctx.peers {
                     send_append_entries_msg(ctx, peer, false);
                 }
@@ -588,7 +613,7 @@ fn send_request_vote_resp_msg(ctx: &RaftCtx, peer_node_id: NodeId, vote_granted:
     if let Some(peer) = ctx.find_peer(peer_node_id) {
         let _ = peer.sender.try_send(PeerMsg::RequestVoteResp {
             node_id: ctx.node_id,
-            term: ctx.term,
+            term: ctx.log.term(),
             vote_granted,
         });
     }
@@ -598,7 +623,7 @@ fn send_heartbeat_msg(ctx: &RaftCtx, peer: &Peer) {
     let (prev_log_idx, prev_log_term) = ctx.log.last_info();
     let _ = peer.sender.try_send(PeerMsg::AppendEntries {
         node_id: ctx.node_id,
-        term: ctx.term,
+        term: ctx.log.term(),
         prev_log_idx,
         prev_log_term,
         entries: Vec::with_capacity(0),
@@ -623,7 +648,7 @@ fn send_append_entries_msg(ctx: &RaftCtx, peer: &Peer, all: bool) {
 
     let _ = peer.sender.try_send(PeerMsg::AppendEntries {
         node_id: ctx.node_id,
-        term: ctx.term,
+        term: ctx.log.term(),
         prev_log_idx,
         prev_log_term,
         leader_commit_idx: ctx.log.latest_commit,
@@ -645,7 +670,7 @@ fn send_append_entries_resp_msg(ctx: &RaftCtx, peer_node_id: NodeId, success: bo
     if let Some(peer) = ctx.find_peer(peer_node_id) {
         let _ = peer.sender.try_send(PeerMsg::AppendEntriesResp {
             node_id: ctx.node_id,
-            term: ctx.term,
+            term: ctx.log.term(),
             success,
             match_idx: ctx.log.latest_index,
             next_idx,
